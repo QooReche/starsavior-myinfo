@@ -588,7 +588,14 @@ try {
         if ($url.Length -lt 30000) {
             Say ''
             Say '사이트를 여는 중입니다... (내 구원자가 자동으로 채워집니다)' 'Cyan'
-            Start-Process explorer.exe $url      # 관리자 창에서도 일반 권한 브라우저로 열도록 explorer 로 위임
+            # 긴 주소를 explorer 에 직접 주면 해석하지 못하고 폴더가 열린다. 그래서 주소로 이동하는 작은 HTML 을 만들어
+            # explorer 로 연다(관리자 창에서도 일반 권한의 기본 브라우저로 열림). 파일은 잠시 뒤 지운다.
+            $open = Join-Path $env:TEMP 'ss_myinfo_open.html'
+            $h = '<!doctype html><meta charset="utf-8"><title>스타세이비어 내 정보</title><body style="font-family:sans-serif;padding:24px">사이트로 이동 중입니다... 이동하지 않으면 <a id="a">여기</a>를 누르세요.<script>var u="' + $url + '";document.getElementById("a").href=u;location.replace(u);</script></body>'
+            [IO.File]::WriteAllText($open, $h, (New-Object Text.UTF8Encoding($false)))
+            Start-Process explorer.exe -ArgumentList ('"{0}"' -f $open)
+            Start-Process powershell -WindowStyle Hidden -ArgumentList ('-NoProfile -Command "Start-Sleep 120; Remove-Item -LiteralPath ''{0}'' -Force -ErrorAction SilentlyContinue"' -f $open)
+            Say '사이트가 열리지 않으면 사이트의 [내 구원자 → 내 정보 불러오기 → 파일 선택] 으로 위 내정보.json 을 고르세요.'
         } else {
             Say '데이터가 커서 자동으로 열 수 없습니다. 사이트에서 [파일 선택] 으로 위 파일을 올려 주세요.' 'Yellow'
         }
