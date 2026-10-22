@@ -6,7 +6,7 @@ param(
     [string]$Out = '',
     [string]$Pcap = '',        # 이미 만든 캡처 파일을 해독만 할 때
     [string]$StopFile = '',    # 자동화용(이 파일이 생기면 캡처 종료)
-    [int]$Port = 0,            # 0 = 자동(9300~9400 구간을 모두 듣고, 해독은 어느 포트든 받음). 서버 포트는 업데이트로 바뀐 적이 있음(9340 -> 9390)
+    [int]$Port = 0,            # 0 = 자동(TCP 전체를 받고 해독기가 서버 흐름을 고름). 서버 포트는 업데이트로 바뀐 적이 있음(9340 -> 9390)
     [string]$Page = 'https://qooreche.github.io/starsavior-party-navigator/',   # 끝나면 이 사이트를 열고 데이터를 넘김
     [switch]$NoOpen
 )
@@ -106,7 +106,31 @@ public static class SsMyInfo
             off += (int)len;
         }
         var result = new List<byte[]>();
+        // 서버 포트를 모를 때(serverPort<=0)는 9300~9400 출발 흐름을 먼저, 그 밖은 443/80/53 을 뺀 뒤 큰 흐름 순으로 시도한다.
+        var order = new List<KeyValuePair<string, List<Seg>>>();
         foreach (var kv in flows)
+        {
+            int sp = 0;
+            try { sp = int.Parse(kv.Key.Split(':')[1].Split('>')[0]); } catch { }
+            if (serverPort <= 0 && (sp == 443 || sp == 80 || sp == 53)) continue;
+            order.Add(kv);
+        }
+        order.Sort((a, b) =>
+        {
+            Func<KeyValuePair<string, List<Seg>>, int> pri = x =>
+            {
+                int sp = 0;
+                try { sp = int.Parse(x.Key.Split(':')[1].Split('>')[0]); } catch { }
+                return (sp >= 9300 && sp <= 9400) ? 0 : 1;
+            };
+            int c = pri(a).CompareTo(pri(b));
+            if (c != 0) return c;
+            long la = 0, lb = 0;
+            foreach (var s in a.Value) la += s.P.Length;
+            foreach (var s in b.Value) lb += s.P.Length;
+            return lb.CompareTo(la);
+        });
+        foreach (var kv in order)
         {
             var segs = kv.Value;
             uint first = segs[0].Seq;
@@ -611,14 +635,11 @@ try {
             Say '[주의] 스타세이비어가 이미 실행 중입니다. 로그인 정보는 "게임을 켤 때" 한 번만 오므로,' 'Yellow'
             Say '       게임을 완전히 종료한 뒤 아래 안내대로 다시 실행해야 합니다.' 'Yellow'
         }
-        # 서버 포트가 업데이트로 바뀐 적이 있어(9340 -> 9390) 9300~9400 을 10 단위로 모두 듣는다(필터 1개에 포트 2개).
-        $ports = @(9300,9310,9320,9330,9340,9350,9360,9370,9380,9390,9400)
-        if ($Port -gt 0 -and ($ports -notcontains $Port)) { $ports += $Port }
+        # 서버 포트가 업데이트로 바뀐 적이 있다(9340 -> 9390). pktmon 의 -p 는 "포트 둘 다 가진 패킷"만 맞추고 필터는 최대 32개라
+        # 포트 구간을 지정할 수 없다. 그래서 -Port 를 주지 않으면 TCP 전체를 받고, 해독기가 9300~9400 흐름을 우선해 고른다.
         [void](Pkt stop); [void](Pkt filter remove)
-        for ($i = 0; $i -lt $ports.Count; $i += 2) {
-            if ($i + 1 -lt $ports.Count) { [void](Pkt filter add ('SSGame' + $i) -t TCP -p $ports[$i] $ports[$i + 1]) }
-            else { [void](Pkt filter add ('SSGame' + $i) -t TCP -p $ports[$i]) }
-        }
+        if ($Port -gt 0) { [void](Pkt filter add SSGame -t TCP -p $Port) }
+        else { [void](Pkt filter add SSGame -t TCP) }
         [void](Pkt filter list)
         $startOut = Pkt start --capture --pkt-size 0 --file-name $etl
         if ($startOut -match '(?i)error|오류|실패|failed|이미|already') { Say ('[경고] 캡처 시작 응답에 문제가 있을 수 있습니다: ' + ($startOut -split "`n")[0]) 'Yellow' }
