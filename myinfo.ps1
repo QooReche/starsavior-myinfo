@@ -627,12 +627,12 @@ public static class SsMyInfo
         root["format"] = Format; root["game_build"] = buildLabel;
         root["exported_at"] = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:sszzz");
         root["star_link_level"] = L(synchro[2]); root["tactics"] = tac; root["units"] = units;
-        // 보유 브레이크 스킬(궤도 배열) ud[5]: [스킬 ID, 값1, 값2, 시각]. 값1·값2 중 어느 쪽이 레벨인지는 실캡처로 확정(미검증)
+        // 보유 브레이크 스킬(궤도 배열) ud[31]: [스킬 ID, 레벨]. 스킬 획득·레벨업 응답이 돌려주는 쌍과 같은 클래스(레벨 1~10). 실캡처 대조는 미검증
         var brk = new List<object>();
-        foreach (object bo in A(ud[5]))
+        foreach (object bo in A(ud[31]))
         {
             var b = A(bo); var bd = new Dictionary<string, object>();
-            bd["id"] = L(b[0]); bd["v1"] = L(b[1]); bd["v2"] = L(b[2]); brk.Add(bd);
+            bd["id"] = L(b[0]); bd["level"] = L(b[1]); brk.Add(bd);
         }
         root["break_skills"] = brk;
         var js = new JavaScriptSerializer(); js.MaxJsonLength = int.MaxValue; js.RecursionLimit = 200;
