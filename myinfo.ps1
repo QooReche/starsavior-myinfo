@@ -6,7 +6,7 @@ param(
     [string]$Out = '',
     [string]$Pcap = '',        # 이미 만든 캡처 파일을 해독만 할 때
     [string]$StopFile = '',    # 자동화용(이 파일이 생기면 캡처 종료)
-    [int]$Port = 9340,
+    [int]$Port = 0,            # 0 = 자동(9300~9400 구간을 모두 듣고, 해독은 어느 포트든 받음). 서버 포트는 업데이트로 바뀐 적이 있음(9340 -> 9390)
     [string]$Page = 'https://qooreche.github.io/starsavior-party-navigator/',   # 끝나면 이 사이트를 열고 데이터를 넘김
     [switch]$NoOpen
 )
@@ -16,8 +16,22 @@ $auto = [bool]$StopFile
 
 function Say([string]$m, [string]$c = 'White') { Write-Host $m -ForegroundColor $c }
 function Pause-End { if (-not $auto) { Write-Host ''; [void](Read-Host '엔터를 누르면 창이 닫힙니다') } }
-function Fail([string]$m) { Say ''; Say ('[오류] ' + $m) 'Red'; Pause-End; exit 1 }
-function Pkt { $o = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & pktmon @args *> $null; $ErrorActionPreference = $o }
+$diag = New-Object System.Collections.Generic.List[string]
+function DiagAdd([string]$m) { [void]$diag.Add($m) }
+function Fail([string]$m) {
+    Say ''; Say ('[오류] ' + $m) 'Red'
+    try {
+        if ($diag.Count -gt 0) {
+            $dp = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보_진단.txt'
+            $hdr = @('스타세이비어 내 정보 추출 진단 (닉네임·UID·토큰·게임 데이터는 들어 있지 않습니다)', ('build ' + $BuildLabel + ', ' + (Get-Date -Format 's')), ('OS ' + [Environment]::OSVersion.VersionString + ', PS ' + $PSVersionTable.PSVersion), ('오류: ' + $m), '')
+            [IO.File]::WriteAllText($dp, (($hdr + $diag.ToArray()) -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
+            Say ('진단 파일을 저장했습니다: ' + $dp + '  (문제 해결을 위해 이 파일을 보내 주세요)') 'Yellow'
+        }
+    } catch {}
+    Pause-End; exit 1
+}
+# pktmon 실행(출력은 진단용으로 보관)
+function Pkt { $o = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; $r = ''; try { $r = (& pktmon @args 2>&1 | Out-String).Trim() } catch { $r = 'EXC ' + $_.Exception.Message }; $ErrorActionPreference = $o; DiagAdd ('> pktmon ' + ($args -join ' ') + "`r`n" + $r); return $r }
 
 if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보.json' }
 
@@ -60,10 +74,18 @@ public static class SsMyInfo
     // ------------------------------------------------------------------ pcapng + TCP
     sealed class Seg { public uint Seq; public byte[] P; }
 
+    // 진단용: 캡처에 실제로 들어 있는 TCP 흐름 요약(닉네임·UID·토큰 없음. 주소·포트·바이트 수만)
+    public static string LastDiag = "";
+    static Dictionary<string, long> diagBytes = new Dictionary<string, long>();
+    static Dictionary<string, long> diagPkts = new Dictionary<string, long>();
+    static long diagBlocks, diagNonTcp;
+    static string diagLinks = "";
+
     // 서버(serverPort) -> 클라이언트 방향 TCP 흐름들을 재조립해 돌려준다.
     public static List<byte[]> ServerStreams(string pcapPath, int serverPort)
     {
         byte[] d = File.ReadAllBytes(pcapPath);
+        diagBytes.Clear(); diagPkts.Clear(); diagBlocks = 0; diagNonTcp = 0; diagLinks = "";
         var link = new List<int>();
         var flows = new Dictionary<string, List<Seg>>();
         int off = 0;
@@ -72,9 +94,10 @@ public static class SsMyInfo
             uint type = BitConverter.ToUInt32(d, off);
             uint len = BitConverter.ToUInt32(d, off + 4);
             if (len < 12 || (long)off + len > d.Length) break;
-            if (type == 1 && len >= 20) link.Add(BitConverter.ToUInt16(d, off + 8));
+            if (type == 1 && len >= 20) { link.Add(BitConverter.ToUInt16(d, off + 8)); diagLinks += BitConverter.ToUInt16(d, off + 8) + " "; }
             else if (type == 6 && len >= 32)
             {
+                diagBlocks++;
                 uint iid = BitConverter.ToUInt32(d, off + 8);
                 int cap = (int)BitConverter.ToUInt32(d, off + 20);
                 int lt = iid < link.Count ? link[(int)iid] : 1;
@@ -101,6 +124,7 @@ public static class SsMyInfo
             }
             result.Add(ms.ToArray());
         }
+        BuildDiag(d.Length, flows);
         return result;
     }
 
@@ -113,10 +137,10 @@ public static class SsMyInfo
             int et = (d[pos + 12] << 8) | d[pos + 13];
             pos += 14;
             if (et == 0x8100 || et == 0x88A8) { if (cap < 18) return; et = (d[pos + 2] << 8) | d[pos + 3]; pos += 4; }
-            if (et != 0x0800) return;
+            if (et != 0x0800) { diagNonTcp++; return; }
         }
-        else if (linktype != 101) return;
-        if (end - pos < 20 || (d[pos] >> 4) != 4 || d[pos + 9] != 6) return;
+        else if (linktype != 101) { diagNonTcp++; return; }
+        if (end - pos < 20 || (d[pos] >> 4) != 4 || d[pos + 9] != 6) { diagNonTcp++; return; }
         int ihl = (d[pos] & 0x0F) * 4;
         int total = (d[pos + 2] << 8) | d[pos + 3];
         int ipEnd = Math.Min(end, pos + total);
@@ -124,7 +148,13 @@ public static class SsMyInfo
         int t = pos + ihl;
         int sport = (d[t] << 8) | d[t + 1];
         int dport = (d[t + 2] << 8) | d[t + 3];
-        if (sport != serverPort) return;
+        {
+            string dk = d[pos + 12] + "." + d[pos + 13] + "." + d[pos + 14] + "." + d[pos + 15] + ":" + sport + " > " + d[pos + 16] + "." + d[pos + 17] + "." + d[pos + 18] + "." + d[pos + 19] + ":" + dport;
+            long c; diagPkts.TryGetValue(dk, out c); diagPkts[dk] = c + 1;
+            int tdoff = (d[t + 12] >> 4) * 4; int pl = ipEnd - (t + tdoff);
+            if (tdoff >= 20 && pl > 0) { diagBytes.TryGetValue(dk, out c); diagBytes[dk] = c + pl; }
+        }
+        if (serverPort > 0 && sport != serverPort) return;
         uint seq = ((uint)d[t + 4] << 24) | ((uint)d[t + 5] << 16) | ((uint)d[t + 6] << 8) | d[t + 7];
         int doff = (d[t + 12] >> 4) * 4;
         if (doff < 20 || t + doff > ipEnd) return;
@@ -136,6 +166,41 @@ public static class SsMyInfo
         List<Seg> l;
         if (!flows.TryGetValue(key, out l)) { l = new List<Seg>(); flows[key] = l; }
         l.Add(new Seg { Seq = seq, P = p });
+    }
+
+    static string Hex(byte[] b, int n)
+    {
+        var sb = new StringBuilder();
+        for (int i = 0; i < n && i < b.Length; i++) sb.Append(b[i].ToString("X2")).Append(' ');
+        return sb.ToString().Trim();
+    }
+
+    static void BuildDiag(int fileLen, Dictionary<string, List<Seg>> flows)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("pcapng " + fileLen + " bytes, linktypes [" + diagLinks.Trim() + "], packet blocks " + diagBlocks + ", non-IPv4/TCP packets " + diagNonTcp);
+        var list = new List<KeyValuePair<string, long>>(diagBytes);
+        list.Sort((a, b) => b.Value.CompareTo(a.Value));
+        sb.AppendLine("TCP flows with payload: " + list.Count + " (top 8 by bytes; the capture filter is by port, so these are the candidates)");
+        for (int i = 0; i < list.Count && i < 8; i++)
+        {
+            long pk; diagPkts.TryGetValue(list[i].Key, out pk);
+            sb.AppendLine("  " + list[i].Key + "  payload " + list[i].Value + " bytes, packets " + pk);
+        }
+        long totalFlows = diagPkts.Count;
+        sb.AppendLine("TCP flows seen (any, incl. no payload): " + totalFlows);
+        string bigKey = null; int bigLen = -1;
+        foreach (var kv in flows)
+        {
+            long len = 0; foreach (var sg in kv.Value) len += sg.P.Length;
+            if (len > bigLen) { bigLen = (int)len; bigKey = kv.Key; }
+        }
+        if (bigKey != null)
+        {
+            var first = flows[bigKey]; uint b0 = first[0].Seq; first.Sort((a, b) => unchecked((int)(a.Seq - b0)).CompareTo(unchecked((int)(b.Seq - b0))));
+            sb.AppendLine("largest server->client flow " + bigKey.Replace(">", " > ") + " (" + bigLen + " bytes) first 24 bytes: " + Hex(first[0].P, 24));
+        }
+        LastDiag = sb.ToString();
     }
 
     // ------------------------------------------------------------------ 프레임
@@ -415,11 +480,13 @@ public static class SsMyInfo
                 object obj = DecodeClass(r, sc, sc.PacketClass);
                 if (r.P != body.Length)
                     throw new InvalidDataException("해독 불일치(" + r.P + "/" + body.Length + "): 게임이 업데이트되어 도구도 갱신이 필요합니다.");
+                LastDiag += "decode: LOGIN_ACK found in stream " + streams + " (frame " + frames + ")" + Environment.NewLine;
                 info = "stream " + streams + ", frames " + frames + ", body " + body.Length + " bytes";
                 return obj;
             }
         }
         info = "streams " + streams + ", frames " + frames;
+        LastDiag += "decode: streams " + streams + ", frames " + frames + ", LOGIN_ACK(403) not found" + Environment.NewLine;
         return null;
     }
 
@@ -544,31 +611,42 @@ try {
             Say '[주의] 스타세이비어가 이미 실행 중입니다. 로그인 정보는 "게임을 켤 때" 한 번만 오므로,' 'Yellow'
             Say '       게임을 완전히 종료한 뒤 아래 안내대로 다시 실행해야 합니다.' 'Yellow'
         }
-        Pkt stop; Pkt filter remove; Pkt filter add SSGame -t TCP -p $Port
-        Pkt start --capture --pkt-size 0 --file-name $etl
+        # 서버 포트가 업데이트로 바뀐 적이 있어(9340 -> 9390) 9300~9400 을 10 단위로 모두 듣는다(필터 1개에 포트 2개).
+        $ports = @(9300,9310,9320,9330,9340,9350,9360,9370,9380,9390,9400)
+        if ($Port -gt 0 -and ($ports -notcontains $Port)) { $ports += $Port }
+        [void](Pkt stop); [void](Pkt filter remove)
+        for ($i = 0; $i -lt $ports.Count; $i += 2) {
+            if ($i + 1 -lt $ports.Count) { [void](Pkt filter add ('SSGame' + $i) -t TCP -p $ports[$i] $ports[$i + 1]) }
+            else { [void](Pkt filter add ('SSGame' + $i) -t TCP -p $ports[$i]) }
+        }
+        [void](Pkt filter list)
+        $startOut = Pkt start --capture --pkt-size 0 --file-name $etl
+        if ($startOut -match '(?i)error|오류|실패|failed|이미|already') { Say ('[경고] 캡처 시작 응답에 문제가 있을 수 있습니다: ' + ($startOut -split "`n")[0]) 'Yellow' }
         Say ''
         Say '캡처를 시작했습니다. 이제 아래 순서대로 진행하세요.' 'Green'
         Say '  1) 스타세이비어를 실행하세요. (이미 켜져 있었다면 완전히 종료 후 다시 실행)'
-        Say '  2) 로그인해서 메인 화면(로비)까지 들어가세요.'
-        Say '  3) 로비에서 10초 정도 기다리세요. (자동으로 불러오는 정보를 다 받는 시간입니다)'
-        Say '  4) 이 창으로 돌아와서 엔터(Enter)를 누르세요.'
+        Say '  2) 로그인해서 메인 화면(로비)이 뜨면, 이 창으로 돌아와 엔터(Enter)를 누르세요.'
         Say ''
         if ($auto) {
             $t0 = Get-Date
             while (-not (Test-Path $StopFile) -and ((Get-Date) - $t0).TotalMinutes -lt 15) { Start-Sleep -Milliseconds 500 }
-        } else { [void](Read-Host '로비에 도착했으면 엔터를 누르세요') }
+        } else { [void](Read-Host '로비가 뜨면 엔터를 누르세요') }
+        Start-Sleep -Seconds 2   # 마지막 패킷이 캡처에 반영될 시간
         Say '정리 중...'
-        Pkt stop
-        Pkt etl2pcap $etl --out $pcapPath
-        Pkt filter remove
+        [void](Pkt stop)
+        DiagAdd ('cap.etl: ' + $(if (Test-Path $etl) { (Get-Item $etl).Length.ToString() + ' bytes' } else { '없음' }))
+        [void](Pkt etl2pcap $etl --out $pcapPath)
+        [void](Pkt filter remove)
+        DiagAdd ('cap.pcapng: ' + $(if (Test-Path $pcapPath) { (Get-Item $pcapPath).Length.ToString() + ' bytes' } else { '없음' }))
         if (-not (Test-Path $pcapPath)) { Fail '캡처 파일을 만들지 못했습니다.' }
     }
 
     Say '해독 중... (몇 초 걸립니다)'
     $units = 0; $info = ''
     $json = [SsMyInfo]::Run($pcapPath, $schemaJson, $BuildLabel, $Port, [ref]$units, [ref]$info)
+    DiagAdd ([SsMyInfo]::LastDiag)
     if (-not $json) {
-        Fail ('로그인 정보를 찾지 못했습니다(' + $info + '). 게임을 "캡처를 시작한 뒤" 실행해 로비까지 들어갔는지 확인하고 다시 해 보세요.')
+        Fail ('로그인 정보를 찾지 못했습니다(' + $info + '). 게임을 "캡처를 시작한 뒤" 실행해 로비까지 들어갔는지 확인하고 다시 해 보세요. 그래도 안 되면 진단 파일을 보내 주세요.')
     }
     [IO.File]::WriteAllText($Out, $json, (New-Object Text.UTF8Encoding($false)))
     Say ''
@@ -603,10 +681,10 @@ try {
         Say '이 파일을 파티 네비게이터의 [내 정보 불러오기] 에서 선택하세요.'
     }
 }
-catch { Fail $_.Exception.Message }
+catch { DiagAdd ('exception: ' + $_.Exception.Message); DiagAdd ([SsMyInfo]::LastDiag); Fail $_.Exception.Message }
 finally {
     if (-not $Pcap) {
-        Pkt stop; Pkt filter remove
+        [void](Pkt stop); [void](Pkt filter remove)
         if (Test-Path $work) { Get-ChildItem $work -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue }
     }
 }
