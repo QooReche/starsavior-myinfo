@@ -403,10 +403,33 @@ public static class SsMyInfo
         if (ms.Length > 0) output.Add(ms.ToArray()); ms.Dispose(); return output;
     }
 
+    static bool LooksRawIp(byte[] d, int pos, int cap)
+    {
+        if (cap >= 20 && (d[pos] >> 4) == 4)
+        {
+            int ihl = (d[pos]&15)*4, total = U16(d,pos+2);
+            if (ihl < 20 || ihl > cap || total < ihl || total > cap) return false;
+            uint sum = 0;
+            for (int i = 0; i < ihl; i += 2) sum += (uint)U16(d,pos+i);
+            while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
+            return sum == 0xFFFF;
+        }
+        if (cap >= 40 && (d[pos] >> 4) == 6) return 40+U16(d,pos+4) == cap;
+        return false;
+    }
+
     static void ParseTcp(byte[] d, int pos, int cap, int lt, int sectionId, Dictionary<string, Flow> flows, Dictionary<string, Connection> connections)
     {
         int end = pos+cap, et = 0;
-        if (lt == 1) { if (cap < 14) { Count("short-link"); return; } et = U16(d,pos+12); pos += 14; }
+        if (lt == 1)
+        {
+            if (cap < 14) { Count("short-link"); return; }
+            int et0 = U16(d,pos+12);
+            // VPN 터널 어댑터(예: Cato)는 이더넷 헤더 없이 IP 패킷을 내보내는데 pktmon 이 linktype 1 로 적는다.
+            // 종류값이 IP·VLAN 이 아니고 맨 앞이 온전한 IP 헤더(IPv4 체크섬·길이, IPv6 길이 일치)면 그대로 IP 로 읽는다.
+            if (et0 != 0x0800 && et0 != 0x86DD && et0 != 0x8100 && et0 != 0x88A8 && et0 != 0x9100 && LooksRawIp(d,pos,cap)) { Count("raw-IP-in-ethernet"); }
+            else { et = et0; pos += 14; }
+        }
         else if (lt == 113) { if (cap < 16) { Count("short-link"); return; } et = U16(d,pos+14); pos += 16; }
         else if (lt == 276) { if (cap < 20) { Count("short-link"); return; } et = U16(d,pos); pos += 20; }
         else if (lt == 0) { if (cap < 4) { Count("short-link"); return; } pos += 4; }
@@ -1025,12 +1048,12 @@ try {
             [IO.File]::WriteAllText($open, $h, (New-Object Text.UTF8Encoding($false)))
             Start-Process explorer.exe -ArgumentList ('"{0}"' -f $open)
             Start-Process powershell -WindowStyle Hidden -ArgumentList ('-NoProfile -Command "Start-Sleep 120; Remove-Item -LiteralPath ''{0}'' -Force -ErrorAction SilentlyContinue"' -f $open)
-            Say '안 열리면 사이트의 [내 구원자 → 내 정보 불러오기]에서 내정보.json 을 선택하세요.'
+            Say '안 열리면 사이트의 [내 계정 정보 불러오기]에서 내정보.json 을 선택하세요.'
         } else {
-            Say '자동으로 열기에는 데이터가 큽니다. 사이트의 [내 정보 불러오기]에서 내정보.json 을 선택하세요.' 'Yellow'
+            Say '자동으로 열기에는 데이터가 큽니다. 사이트의 [내 계정 정보 불러오기]에서 내정보.json 을 선택하세요.' 'Yellow'
         }
     } else {
-        Say '파티 네비게이터의 [내 정보 불러오기]에서 이 파일을 선택하세요.'
+        Say '파티 네비게이터의 [내 계정 정보 불러오기]에서 이 파일을 선택하세요.'
     }
 }
 catch {
