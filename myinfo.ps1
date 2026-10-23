@@ -18,67 +18,203 @@ function Say([string]$m, [string]$c = 'White') { Write-Host $m -ForegroundColor 
 function Pause-End { if (-not $auto) { Write-Host ''; [void](Read-Host '엔터를 누르면 창이 닫힙니다') } }
 $diag = New-Object System.Collections.Generic.List[string]
 function DiagAdd([string]$m) { [void]$diag.Add($m) }
-function Fail([string]$m) {
-    Say ''; Say ('[오류] ' + $m) 'Red'
+
+# CommandLineToArgvW / C runtime quoting: double backslashes before a quote or closing quote.
+function Quote-WindowsArg([string]$Value) {
+    '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+}
+function Validate-Inputs {
+    if ($Port -lt 0 -or $Port -gt 65535) { throw '포트는 0~65535여야 합니다.' }
+    if (-not $Out) { $script:Out = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보.json' }
+    if ($Out.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0 -or $Out -match '[\x00-\x1f]' -or $Out -match '[\\/]$') { throw '저장 파일 경로가 올바르지 않습니다.' }
+    $script:Out = [IO.Path]::GetFullPath($Out)
+    if ([IO.Path]::GetFileName($Out).IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { throw '저장 파일 이름이 올바르지 않습니다.' }
+    if ($Page) {
+        $uri = $null
+        if ($Page -match '[\x00-\x20"<>\\]' -or -not [Uri]::TryCreate($Page, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin @('http', 'https') -or $uri.UserInfo -or $uri.Fragment) { throw '사이트 주소는 사용자 정보·해시가 없는 http/https 주소여야 합니다.' }
+        $script:Page = $uri.AbsoluteUri
+    }
+}
+function Get-ShortPath([string]$Path) {
     try {
-        if ($true) {   # 실패하면 항상 진단 파일을 남긴다(이른 실패도 오류 문구·환경은 기록)
-            $dp = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보_진단.txt'
-            $hdr = @('스타세이비어 내 정보 추출 진단 (닉네임·UID·토큰·게임 데이터는 없음, PC 사용자 이름·IP 는 가림)', ('build ' + $BuildLabel + ', ' + (Get-Date -Format 's')), ('OS ' + [Environment]::OSVersion.VersionString + ', PS ' + $PSVersionTable.PSVersion), ('오류: ' + $m), '')
-            [IO.File]::WriteAllText($dp, (Mask-Diag (($hdr + $diag.ToArray()) -join "`r`n")), (New-Object Text.UTF8Encoding($true)))
-            Say ''
-            Say '실패 기록을 바탕화면에 저장했습니다. 이 파일을 관리자에게 보내 주세요.' 'Yellow'
-            Say ('  ' + $dp) 'Yellow'
-            Say '  (닉네임·계정 정보는 들어 있지 않습니다)' 'Yellow'
-            if (-not $auto) { try { Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $dp) } catch {} }
+        $fs = New-Object -ComObject Scripting.FileSystemObject
+        try { return $fs.GetFolder($Path).ShortPath } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($fs) }
+    } catch { return $null }
+}
+function Normalize-IP([string]$Value) {
+    $ip = $null; $v = ($Value.Trim('[', ']') -split '%', 2)[0]
+    if ([Net.IPAddress]::TryParse($v, [ref]$ip)) {
+        if ($ip.IsIPv4MappedToIPv6) { $ip = $ip.MapToIPv4() }
+        return ([BitConverter]::ToString($ip.GetAddressBytes()))
+    }
+    return $null
+}
+$script:IpAliases = @{}
+function Mask-Diag([string]$t) {
+    $roots = @(@($env:TEMP, '%TEMP%'), @([Environment]::GetFolderPath('Desktop'), '%DESKTOP%'), @($env:OneDrive, '%OneDrive%'), @($env:OneDriveCommercial, '%OneDrive%'), @($env:USERPROFILE, '%USERPROFILE%'))
+    $paths = @()
+    foreach ($pair in $roots) {
+        if ($pair[0]) {
+            $paths += ,$pair
+            $short = Get-ShortPath $pair[0]
+            if ($short) { $paths += ,@($short, $pair[1]) }
         }
-    } catch {}
+    }
+    foreach ($pair in ($paths | Sort-Object { $_[0].Length } -Descending)) {
+        $pat = '(?<![\w\\/])' + ([regex]::Escape($pair[0].TrimEnd('\', '/')) -replace '\\\\', '[\\/]') + '(?=[\\/]|$|[\s"''),;])'
+        $replacement = $pair[1]
+        $t = [regex]::Replace($t, $pat, [Text.RegularExpressions.MatchEvaluator]{ param($m) $replacement }, 'IgnoreCase')
+    }
+    # Only complete path components, never a username embedded in arbitrary text.
+    $names = @($env:USERNAME, $(if ($env:USERPROFILE) { Split-Path $env:USERPROFILE -Leaf }))
+    $shortHome = Get-ShortPath $env:USERPROFILE
+    if ($shortHome) { $names += Split-Path $shortHome -Leaf }
+    foreach ($name in $names) {
+        if ($name) { $t = [regex]::Replace($t, '(?<=[\\/])' + [regex]::Escape($name) + '(?=[\\/]|$|["''])', '%USERNAME%', 'IgnoreCase') }
+    }
+    $local = @{}
+    try {
+        foreach ($ni in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) { $local[(Normalize-IP $ua.Address.ToString())] = $true }
+        }
+    } catch { }
+    foreach ($addr in @('127.0.0.1', '::1') + @($script:ExtraLocalAddresses)) { if ($addr) { $local[(Normalize-IP $addr)] = $true } }
+    # Whole candidates are parsed before replacement, so IPv6 compression/case/scope cannot leak or partially match.
+    $pattern = '(?<![\w:.])(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+(?:%[\w.-]+)?)(?![\w:.])'
+    return [regex]::Replace($t, $pattern, [Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $candidate = $m.Value; $portSuffix = ''
+        if ($candidate -match '^(\d+\.\d+\.\d+\.\d+)(:\d+)$') { $candidate = $Matches[1]; $portSuffix = $Matches[2] }
+        $key = Normalize-IP $candidate
+        if (-not $key) { return $m.Value }
+        if ($local.ContainsKey($key)) { return '(내 PC IP)' + $portSuffix }
+        if (-not $script:IpAliases.ContainsKey($key)) { $script:IpAliases[$key] = '(상대 IP ' + ($script:IpAliases.Count + 1) + ')' }
+        return $script:IpAliases[$key] + $portSuffix
+    })
+}
+function Remove-CaptureFile([string]$Path) {
+    if ($Path -and (Test-Path -LiteralPath $Path)) {
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop; DiagAdd ('capture-deleted: ' + $Path) }
+        catch {
+            DiagAdd ('capture-delete-failed: ' + $Path + ' ' + $_.Exception.GetType().Name)
+            Say ('캡처 삭제 실패: ' + $Path + ' (계정 정보가 있으니 보내지 말 것)') 'Yellow'
+        }
+    }
+}
+function Clear-ExpiredCaptures([string]$Directory) {
+    if (-not (Test-Path -LiteralPath $Directory)) { return }
+    try {
+        Get-ChildItem -LiteralPath $Directory -File -ErrorAction Stop | Where-Object {
+            $_.Name -match '^cap(?:-[0-9a-f-]+)?\.(pcapng|etl)$' -and $_.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddHours(-24)
+        } | ForEach-Object { Remove-CaptureFile $_.FullName }
+    } catch { DiagAdd ('capture-expiry-failed: ' + $_.Exception.GetType().Name) }
+}
+function Cleanup-Capture {
+    if ($script:CaptureActive) {
+        [void](Pkt stop); [void](Pkt filter remove); $script:CaptureActive = $false
+    }
+    if (-not $Pcap) {
+        Remove-CaptureFile $etl
+        if (-not $keepCap) { Remove-CaptureFile $pcapPath }
+    }
+}
+function Preserve-Capture {
+    if (-not $Pcap -and $pcapPath -and (Test-Path -LiteralPath $pcapPath)) {
+        $script:keepCap = $true
+        Say ('[참고] 통신 기록 보존: ' + $pcapPath) 'Yellow'
+        Say '계정 정보가 있으니 보내지 말 것. 24시간이 지난 뒤 다음 실행 시작 때 삭제합니다.' 'Yellow'
+        DiagAdd ('capture-preserved (do not send; expires after 24h at next run): ' + $pcapPath)
+    }
+}
+function Write-Diagnostic([string]$Message, [string]$Desktop = [Environment]::GetFolderPath('Desktop'), [string]$Fallback = $env:TEMP) {
+    foreach ($dir in @($Desktop, $Fallback)) {
+        try {
+            $dp = Join-Path $dir '내정보_진단.txt'
+            $hdr = @('스타세이비어 내 정보 추출 진단 (원시 통신·게임 데이터 없음, PC 사용자 경로·주소 가림)', ('build ' + $BuildLabel + ', ' + (Get-Date -Format 's')), ('OS ' + [Environment]::OSVersion.VersionString + ', PS ' + $PSVersionTable.PSVersion), ('오류: ' + $Message), '')
+            [IO.File]::WriteAllText($dp, (Mask-Diag (($hdr + $diag.ToArray()) -join "`r`n")), (New-Object Text.UTF8Encoding($true)))
+            return $dp
+        } catch { DiagAdd ('diagnostic-save-failed: ' + $dir + ' ' + $_.Exception.GetType().Name) }
+    }
+    return $null
+}
+function Fail([string]$m) {
+    Cleanup-Capture
+    Say ('[오류] ' + $m) 'Red'
+    $dp = Write-Diagnostic $m
+    if ($dp) {
+        Say ('진단 파일을 관리자에게 보내 주세요: ' + $dp) 'Yellow'
+        if (-not $auto -and -not $NoOpen) { try { Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $dp) } catch {} }
+    } else { Say '바탕화면과 임시 폴더 모두 진단 저장에 실패했습니다. 저장 권한과 디스크 여유 공간을 확인해 주세요.' 'Yellow' }
     Pause-End; exit 1
 }
-# pktmon 실행(출력은 진단용으로 보관)
 function Pkt {
-    # pktmon 출력은 Windows 판에 따라 UTF-8 또는 시스템 코드페이지라, 바이트로 받아 UTF-8(엄격) -> 실패 시 OEM 코드페이지로 읽는다(진단 파일 글자 깨짐 방지).
-    $r = ''
+    $r = ''; $code = -1
     try {
         $psi = New-Object Diagnostics.ProcessStartInfo 'pktmon'
-        $psi.Arguments = (($args | ForEach-Object { if ("$_" -match '\s') { '"' + $_ + '"' } else { "$_" } }) -join ' ')
+        $psi.Arguments = (($args | ForEach-Object { Quote-WindowsArg "$_" }) -join ' ')
         $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
         $latin = [Text.Encoding]::GetEncoding(28591); $psi.StandardOutputEncoding = $latin; $psi.StandardErrorEncoding = $latin
         $pr = [Diagnostics.Process]::Start($psi)
-        $errTask = $pr.StandardError.ReadToEndAsync(); $outText = $pr.StandardOutput.ReadToEnd(); $pr.WaitForExit()
-        $raw = $latin.GetBytes($outText + $errTask.Result)
-        try { $r = (New-Object Text.UTF8Encoding($false, $true)).GetString($raw) }
-        catch { $r = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($raw) }
-        $r = $r.Trim()
+        try {
+            $errTask = $pr.StandardError.ReadToEndAsync(); $outText = $pr.StandardOutput.ReadToEnd(); $pr.WaitForExit(); $code = $pr.ExitCode
+            $raw = $latin.GetBytes($outText + $errTask.Result)
+            try { $r = (New-Object Text.UTF8Encoding($false, $true)).GetString($raw) }
+            catch { $r = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($raw) }
+        } finally { $pr.Dispose() }
     } catch { $r = 'EXC ' + $_.Exception.Message }
-    DiagAdd ('> pktmon ' + ($args -join ' ') + "`r`n" + $r); return $r
+    $script:PktExitCode = $code
+    DiagAdd ('> pktmon ' + ($args -join ' ') + ' exit=' + $code + "`r`n" + $r.Trim()); return $r.Trim()
 }
-# 진단 파일에서 PC 사용자 이름(경로)과 이 PC 의 IP 를 가린다(관리자에게 보내는 파일이므로).
-function Mask-Diag([string]$t) {
-    foreach ($kv in @(@($env:USERPROFILE, '%USERPROFILE%'), @($env:TEMP, '%TEMP%'), @($env:USERNAME, '%USERNAME%'))) {
-        if ($kv[0]) { $t = [regex]::Replace($t, [regex]::Escape($kv[0]), $kv[1], 'IgnoreCase') }
+function Record-GameState([string]$Phase) {
+    $procs = @(Get-Process -Name StarSavior -ErrorAction SilentlyContinue)
+    DiagAdd ('game ' + $Phase + ' present=' + ($procs.Count -gt 0))
+    foreach ($proc in $procs) {
+        $script:GameSeen = $true; $script:GamePids[$proc.Id] = $true
+        try {
+            $started = $proc.StartTime.ToUniversalTime()
+            DiagAdd ('game ' + $Phase + ' PID=' + $proc.Id + ' start=' + $started.ToString('o'))
+            if ($script:CaptureStart -and $started -lt $script:CaptureStart) { $script:GamePreexisting = $true }
+        } catch { DiagAdd ('game start-query-failed PID=' + $proc.Id) }
     }
-    try {
-        foreach ($ni in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
-            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
-                $ip = $ua.Address.ToString()
-                if ($ip -ne '127.0.0.1' -and $ip -ne '::1') { $t = [regex]::Replace($t, '(?<![\d.])' + [regex]::Escape($ip) + '(?![\d])', '(내 PC IP)') }
+    if ($Phase -eq 'end') {
+        try {
+            $connections = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object { $script:GamePids.ContainsKey([int]$_.OwningProcess) })
+            DiagAdd ('game TCP count=' + $connections.Count)
+            foreach ($c in $connections) {
+                $script:GameConnected = $true
+                DiagAdd ('game TCP PID=' + $c.OwningProcess + ' local=[' + $c.LocalAddress + ']:' + $c.LocalPort + ' remote=[' + $c.RemoteAddress + ']:' + $c.RemotePort + ' state=' + $c.State)
             }
-        }
-    } catch {}
-    return $t
+        } catch { DiagAdd ('game TCP query-failed: ' + $_.Exception.GetType().Name) }
+    }
+}
+function Get-FailureGuidance {
+    if ($script:GamePreexisting) { return '게임을 완전히 종료한 뒤 다시 해 주세요' }
+    if (-not $Pcap -and -not $script:GameSeen) { return '게임을 켜서 로비까지 들어간 뒤 엔터를 눌러 주세요' }
+    return '게임 업데이트로 도구 갱신이 필요할 수 있습니다. 바탕화면 내정보_진단.txt 를 관리자에게 보내 주세요'
 }
 
-if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보.json' }
+
+$work = Join-Path $env:TEMP 'ss_myinfo'
+$etl = ''; $pcapPath = $Pcap; $keepCap = $false; $script:CaptureActive = $false
+$script:GamePids = @{}; $script:GameSeen = $false; $script:GamePreexisting = $false; $script:GameConnected = $false
+Clear-ExpiredCaptures $work
+try { Validate-Inputs } catch { Fail $_.Exception.Message }
 
 # ---------- 관리자 권한 (캡처에 필요) ----------
 if (-not $Pcap) {
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
         Say '관리자 확인 창이 나오면 [예]를 눌러 주세요. (Windows 내장 통신 확인 도구를 쓰는 데 필요합니다)' 'Yellow'
-        $a = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Port {1} -Out "{2}" -Page "{3}"' -f $PSCommandPath, $Port, $Out, $Page
-        if ($StopFile) { $a += (' -StopFile "{0}"' -f $StopFile) }
-        if ($NoOpen) { $a += ' -NoOpen' }
-        Start-Process powershell -Verb RunAs -ArgumentList $a
+        $launch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Port', "$Port", '-Out', $Out)
+        if ($Page) { $launch += @('-Page', $Page) }
+        if ($StopFile) { $launch += @('-StopFile', $StopFile) }
+        if ($NoOpen -or -not $Page) { $launch += '-NoOpen' }
+        $a = ($launch | ForEach-Object { Quote-WindowsArg $_ }) -join ' '
+        try { Start-Process powershell -Verb RunAs -ArgumentList $a }
+        catch {
+            DiagAdd ('elevation-failed: ' + $_.Exception.GetType().Name)
+            Fail '관리자 실행이 취소되었거나 시작되지 않았습니다. 다시 실행해 관리자 확인 창에서 [예]를 눌러 주세요.'
+        }
         exit
     }
 }
@@ -102,188 +238,243 @@ public sealed class EnumV
 public static class SsMyInfo
 {
     public const string Format = "ss-myinfo-v1";
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct TraceProperties
+    {
+        public uint BufferSize, ProviderId; public ulong HistoricalContext; public long TimeStamp;
+        public Guid Guid; public uint ClientContext, Flags;
+        public uint TraceBufferSize, MinimumBuffers, MaximumBuffers, MaximumFileSize, LogFileMode, FlushTimer, EnableFlags;
+        public int AgeLimit; public uint NumberOfBuffers, FreeBuffers, EventsLost, BuffersWritten, LogBuffersLost, RealTimeBuffersLost;
+        public IntPtr LoggerThreadId; public uint LogFileNameOffset, LoggerNameOffset;
+    }
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+    static extern uint QueryAllTracesW([System.Runtime.InteropServices.In, System.Runtime.InteropServices.Out] IntPtr[] properties, uint count, out uint actual);
+    public static uint TraceQueryCode;
+    public static bool IsCaptureRunning(string path)
+    {
+        // Verify an active ETW file session for our exact file, independent of localized pktmon text.
+        var buffers = new IntPtr[256]; int size = System.Runtime.InteropServices.Marshal.SizeOf(typeof(TraceProperties));
+        try
+        {
+            for (int i=0; i<buffers.Length; i++)
+            {
+                buffers[i] = System.Runtime.InteropServices.Marshal.AllocHGlobal(size+4096);
+                var p = new TraceProperties { BufferSize=(uint)(size+4096), LogFileNameOffset=(uint)size, LoggerNameOffset=(uint)(size+2048) };
+                System.Runtime.InteropServices.Marshal.StructureToPtr(p,buffers[i],false);
+            }
+            uint actual; TraceQueryCode = QueryAllTracesW(buffers,(uint)buffers.Length,out actual);
+            if (TraceQueryCode != 0) return false;
+            for (int i=0; i<Math.Min(actual,(uint)buffers.Length); i++)
+            {
+                var p = (TraceProperties)System.Runtime.InteropServices.Marshal.PtrToStructure(buffers[i],typeof(TraceProperties));
+                if (p.LogFileNameOffset < size || p.LogFileNameOffset >= size+4096) continue;
+                string file = System.Runtime.InteropServices.Marshal.PtrToStringUni(IntPtr.Add(buffers[i],(int)p.LogFileNameOffset));
+                if (!String.IsNullOrEmpty(file) && String.Equals(Path.GetFullPath(file),Path.GetFullPath(path),StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+        finally { foreach (IntPtr b in buffers) if (b != IntPtr.Zero) System.Runtime.InteropServices.Marshal.FreeHGlobal(b); }
+    }
     static readonly byte[] StartMagic = { 0xDD, 0xCC, 0xBB, 0xAA };
     static readonly byte[] EndMagic = { 0x44, 0x33, 0x22, 0x11 };
     static readonly ulong[] Masks = { 0xC4A975489AA72956UL, 0xD7C1A29E30FAE47BUL, 0xDCD6D3F2CCC0DEF9UL, 0x3063872F85428EFCUL };
 
     // ------------------------------------------------------------------ pcapng + TCP
     sealed class Seg { public uint Seq; public byte[] P; }
-
-    // 진단용: 캡처에 실제로 들어 있는 TCP 흐름 요약(닉네임·UID·토큰 없음. 주소·포트·바이트 수만)
+    sealed class Flow
+    {
+        public string Key; public int Port, Session; public long Bytes, Packets;
+        public bool Syn, Tls, Game; public List<Seg> Segs = new List<Seg>();
+    }
+    sealed class Connection
+    {
+        public int Session; public bool Closed, Observed;
+        public Dictionary<string, uint> Syns = new Dictionary<string, uint>();
+    }
     public static string LastDiag = "";
-    static Dictionary<string, long> diagBytes = new Dictionary<string, long>();
-    static Dictionary<string, long> diagPkts = new Dictionary<string, long>();
-    static long diagBlocks, diagNonTcp;
-    static string diagLinks = "";
+    static SortedDictionary<string, long> counts = new SortedDictionary<string, long>();
+    static void Count(string key) { Count(key, 1); }
+    static void Count(string key, long n) { long v; counts.TryGetValue(key, out v); counts[key] = v + n; }
+    static uint U32(byte[] d, int p, bool le)
+    {
+        return le ? (uint)(d[p] | d[p+1] << 8 | d[p+2] << 16 | d[p+3] << 24)
+            : (uint)(d[p] << 24 | d[p+1] << 16 | d[p+2] << 8 | d[p+3]);
+    }
+    static int U16(byte[] d, int p) { return d[p] << 8 | d[p+1]; }
+    static string IP(byte[] d, int p, int n)
+    {
+        byte[] b = new byte[n]; Buffer.BlockCopy(d, p, b, 0, n);
+        return new System.Net.IPAddress(b).ToString();
+    }
 
-    // 서버(serverPort) -> 클라이언트 방향 TCP 흐름들을 재조립해 돌려준다.
     public static List<byte[]> ServerStreams(string pcapPath, int serverPort)
     {
+        LastDiag = ""; counts.Clear();
         byte[] d = File.ReadAllBytes(pcapPath);
-        diagBytes.Clear(); diagPkts.Clear(); diagBlocks = 0; diagNonTcp = 0; diagV6 = 0; diagLinks = "";
-        var link = new List<int>();
-        var flows = new Dictionary<string, List<Seg>>();
-        int off = 0;
+        var links = new List<int>(); var snaps = new List<uint>();
+        var flows = new Dictionary<string, Flow>(); var connections = new Dictionary<string, Connection>();
+        bool le = true; int off = 0, sectionId = 0;
         while (off + 12 <= d.Length)
         {
-            uint type = BitConverter.ToUInt32(d, off);
-            uint len = BitConverter.ToUInt32(d, off + 4);
-            if (len < 12 || (long)off + len > d.Length) break;
-            if (type == 1 && len >= 20) { link.Add(BitConverter.ToUInt16(d, off + 8)); diagLinks += BitConverter.ToUInt16(d, off + 8) + " "; }
-            else if (type == 6 && len >= 32)
+            bool section = U32(d, off, true) == 0x0A0D0D0A;
+            if (section)
             {
-                diagBlocks++;
-                uint iid = BitConverter.ToUInt32(d, off + 8);
-                int cap = (int)BitConverter.ToUInt32(d, off + 20);
-                int lt = iid < link.Count ? link[(int)iid] : 1;
-                ParseTcp(d, off + 28, Math.Min(cap, (int)len - 32), lt, serverPort, flows);
+                if (U32(d, off+8, true) == 0x1A2B3C4D) le = true;
+                else if (U32(d, off+8, false) == 0x1A2B3C4D) le = false;
+                else { Count("malformed-block"); break; }
+                links.Clear(); snaps.Clear(); connections.Clear(); sectionId++;
             }
+            uint type = U32(d, off, le), len = U32(d, off+4, le);
+            if (len < 12 || len % 4 != 0 || (long)off + len > d.Length || U32(d, off+(int)len-4, le) != len)
+            { Count("malformed-block"); break; }
+            Count("block." + type);
+            if (type == 1 && len >= 20)
+            {
+                int lt = le ? d[off+8] | d[off+9] << 8 : U16(d, off+8);
+                links.Add(lt); snaps.Add(U32(d, off+12, le)); Count("interface-linktype." + lt);
+            }
+            else if (type == 6 || type == 3 || type == 2)
+            {
+                int header = type == 3 ? 12 : 28;
+                if (len < header+4) { Count("malformed-packet-block"); off += (int)len; continue; }
+                uint iid = type == 3 ? 0 : type == 2 ? (uint)(le ? d[off+8] | d[off+9] << 8 : U16(d, off+8)) : U32(d, off+8, le);
+                if (iid >= links.Count) { Count("unknown-interface"); off += (int)len; continue; }
+                uint original = U32(d, off+(type == 3 ? 8 : 24), le);
+                uint cap = type == 3 ? (snaps[(int)iid] == 0 ? original : Math.Min(original, snaps[(int)iid])) : U32(d, off+20, le);
+                if (cap < original) Count("capture-truncated");
+                if (cap > len-header-4) { Count("malformed-caplen"); cap = len-(uint)header-4; }
+                Count("linktype." + links[(int)iid]);
+                ParseTcp(d, off+header, (int)cap, links[(int)iid], sectionId, flows, connections);
+            }
+            else if (type != 1 && !section) Count("unsupported-block." + type);
             off += (int)len;
         }
+        if (off != d.Length) Count("trailing-bytes", d.Length-off);
+        var order = new List<Flow>(flows.Values);
+        order.Sort((a,b) => { int c = ((a.Port >= 9300 && a.Port <= 9400) ? 0 : 1).CompareTo((b.Port >= 9300 && b.Port <= 9400) ? 0 : 1); return c != 0 ? c : b.Bytes.CompareTo(a.Bytes); });
         var result = new List<byte[]>();
-        // 서버 포트를 모를 때(serverPort<=0)는 9300~9400 출발 흐름을 먼저, 그 밖은 443/80/53 을 뺀 뒤 큰 흐름 순으로 시도한다.
-        var order = new List<KeyValuePair<string, List<Seg>>>();
-        foreach (var kv in flows)
+        foreach (Flow f in order)
         {
-            int sp = 0;
-            try { sp = FlowSrcPort(kv.Key); } catch { }
-            if (serverPort <= 0 && (sp == 443 || sp == 80 || sp == 53)) continue;
-            order.Add(kv);
-        }
-        order.Sort((a, b) =>
-        {
-            Func<KeyValuePair<string, List<Seg>>, int> pri = x =>
+            // Diagnose all ports, including TLS/443 and flows with no payload.
+            List<byte[]> chunks = Assemble(f);
+            foreach (byte[] chunk in chunks)
             {
-                int sp = 0;
-                try { sp = FlowSrcPort(x.Key); } catch { }
-                return (sp >= 9300 && sp <= 9400) ? 0 : 1;
-            };
-            int c = pri(a).CompareTo(pri(b));
-            if (c != 0) return c;
-            long la = 0, lb = 0;
-            foreach (var s in a.Value) la += s.P.Length;
-            foreach (var s in b.Value) lb += s.P.Length;
-            return lb.CompareTo(la);
-        });
-        foreach (var kv in order)
-        {
-            var segs = kv.Value;
-            uint first = segs[0].Seq;
-            segs.Sort((a, b) => unchecked((int)(a.Seq - first)).CompareTo(unchecked((int)(b.Seq - first))));
-            long cur = 0;
-            var ms = new MemoryStream();
-            foreach (var s in segs)
-            {
-                long rel = unchecked((int)(s.Seq - first));
-                if (rel > cur) { ms.Write(new byte[rel - cur], 0, (int)(rel - cur)); cur = rel; }
-                if (rel + s.P.Length <= cur) continue;
-                int trim = (int)Math.Max(0, cur - rel);
-                ms.Write(s.P, trim, s.P.Length - trim);
-                cur = rel + s.P.Length;
+                if (chunk.Length >= 5 && chunk[0] >= 20 && chunk[0] <= 24 && chunk[1] == 3 && chunk[2] <= 4 && U16(chunk, 3) <= 18432) f.Tls = true;
+                int at = IndexOf(chunk, StartMagic, 0);
+                if (at >= 0 && at+8 <= chunk.Length && U32(chunk, at+4, true) >= 12) f.Game = true;
+                if (serverPort <= 0 || f.Port == serverPort) result.Add(chunk);
             }
-            result.Add(ms.ToArray());
         }
-        BuildDiag(d.Length, flows);
-        return result;
+        var sb = new StringBuilder(); sb.AppendLine("pcapng bytes=" + d.Length);
+        foreach (var c in counts) sb.AppendLine(c.Key + "=" + c.Value);
+        order.Sort((a,b) => b.Bytes.CompareTo(a.Bytes));
+        sb.AppendLine("TCP flows total=" + order.Count + ", listed=" + Math.Min(20, order.Count) + " (top 20, all ports/directions)");
+        for (int i=0; i<order.Count && i<20; i++)
+        {
+            Flow f = order[i]; sb.AppendLine(f.Key + " session=" + f.Session + " bytes=" + f.Bytes + " packets=" + f.Packets + " SYN=" + f.Syn + " TLS=" + f.Tls + " game-header=" + f.Game);
+        }
+        LastDiag = sb.ToString(); return result;
     }
 
-    static int diagV6;
-    // 흐름 키 = "출발>도착|출발포트>도착포트" (IPv6 주소에 ':' 가 있어 포트 구분자를 '|' 로 둠)
-    static int FlowSrcPort(string key)
+    static List<byte[]> Assemble(Flow f)
     {
-        string ports = key.Substring(key.LastIndexOf('|') + 1);
-        return int.Parse(ports.Split('>')[0]);
+        var output = new List<byte[]>(); if (f.Segs.Count == 0) return output;
+        uint anchor = f.Segs[0].Seq;
+        f.Segs.Sort((a,b) => unchecked((int)(a.Seq-anchor)).CompareTo(unchecked((int)(b.Seq-anchor))));
+        uint first = f.Segs[0].Seq; // Reset after sorting, including sequence wraparound.
+        long cur = 0; var ms = new MemoryStream();
+        foreach (Seg seg in f.Segs)
+        {
+            long rel = unchecked((uint)(seg.Seq-first));
+            if (rel > cur)
+            {
+                long gap = rel-cur; Count("gap-count"); Count("gap-bytes", gap);
+                if (gap > 1048576) Count("gap-over-limit");
+                // Never allocate or decode fabricated bytes across missing data.
+                if (ms.Length > 0) output.Add(ms.ToArray()); ms.Dispose(); ms = new MemoryStream(); cur = rel;
+            }
+            if (rel+seg.P.Length <= cur) { Count("retransmit-packets"); continue; }
+            int trim = (int)Math.Max(0, cur-rel);
+            if (ms.Length + seg.P.Length-trim > 64*1024*1024)
+            { Count("stream-size-limit"); output.Add(ms.ToArray()); ms.Dispose(); ms = new MemoryStream(); }
+            ms.Write(seg.P, trim, seg.P.Length-trim); cur = rel+seg.P.Length;
+        }
+        if (ms.Length > 0) output.Add(ms.ToArray()); ms.Dispose(); return output;
     }
 
-    static void ParseTcp(byte[] d, int pos, int cap, int linktype, int serverPort, Dictionary<string, List<Seg>> flows)
+    static void ParseTcp(byte[] d, int pos, int cap, int lt, int sectionId, Dictionary<string, Flow> flows, Dictionary<string, Connection> connections)
     {
-        int end = pos + cap;
-        if (linktype == 1)
+        int end = pos+cap, et = 0;
+        if (lt == 1) { if (cap < 14) { Count("short-link"); return; } et = U16(d,pos+12); pos += 14; }
+        else if (lt == 113) { if (cap < 16) { Count("short-link"); return; } et = U16(d,pos+14); pos += 16; }
+        else if (lt == 276) { if (cap < 20) { Count("short-link"); return; } et = U16(d,pos); pos += 20; }
+        else if (lt == 0) { if (cap < 4) { Count("short-link"); return; } pos += 4; }
+        else if (lt != 101) { Count("unsupported-linktype."+lt); return; }
+        if (et != 0)
         {
-            if (cap < 14) return;
-            int et = (d[pos + 12] << 8) | d[pos + 13];
-            pos += 14;
-            if (et == 0x8100 || et == 0x88A8) { if (cap < 18) return; et = (d[pos + 2] << 8) | d[pos + 3]; pos += 4; }
-            if (et != 0x0800 && et != 0x86DD) { diagNonTcp++; return; }
+            Count("EtherType."+et.ToString("X4"));
+            while (et == 0x8100 || et == 0x88A8 || et == 0x9100)
+            {
+                if (end-pos < 4) { Count("short-vlan"); return; }
+                et = U16(d,pos+2); pos += 4; Count("EtherType."+et.ToString("X4"));
+            }
+            if (et != 0x0800 && et != 0x86DD) { Count("non-IP"); return; }
         }
-        else if (linktype != 101) { diagNonTcp++; return; }
-        // IPv4 또는 IPv6(확장 헤더 없는 TCP). 게임 통신이 IPv6 로 오가는 환경 대응(2026-10-23).
-        int ihl, ipEnd; string src, dst;
-        if (end - pos >= 20 && (d[pos] >> 4) == 4 && d[pos + 9] == 6)
+        if (pos >= end) { Count("short-IP"); return; }
+        int t, ipEnd, next; string src, dst;
+        if ((d[pos] >> 4) == 4)
         {
-            ihl = (d[pos] & 0x0F) * 4;
-            int total = (d[pos + 2] << 8) | d[pos + 3];
-            ipEnd = Math.Min(end, pos + total);
-            src = d[pos + 12] + "." + d[pos + 13] + "." + d[pos + 14] + "." + d[pos + 15];
-            dst = d[pos + 16] + "." + d[pos + 17] + "." + d[pos + 18] + "." + d[pos + 19];
+            if (end-pos < 20) { Count("short-IP"); return; }
+            int ihl = (d[pos]&15)*4, total = U16(d,pos+2);
+            if (ihl < 20 || total < ihl) { Count("malformed-IP"); return; }
+            if (pos+total > end) Count("IP-truncated");
+            ipEnd = Math.Min(end,pos+total); next = d[pos+9]; Count("NextHeader."+next);
+            if ((U16(d,pos+6)&0x3FFF) != 0) { Count("IPv4-fragment-unsupported"); return; }
+            src = IP(d,pos+12,4); dst = IP(d,pos+16,4); t = pos+ihl;
         }
-        else if (end - pos >= 40 && (d[pos] >> 4) == 6 && d[pos + 6] == 6)
+        else if ((d[pos] >> 4) == 6)
         {
-            ihl = 40;
-            int plen6 = (d[pos + 4] << 8) | d[pos + 5];
-            ipEnd = Math.Min(end, pos + 40 + plen6);
-            var a6 = new byte[16]; Buffer.BlockCopy(d, pos + 8, a6, 0, 16); src = "[" + new System.Net.IPAddress(a6).ToString() + "]";
-            var b6 = new byte[16]; Buffer.BlockCopy(d, pos + 24, b6, 0, 16); dst = "[" + new System.Net.IPAddress(b6).ToString() + "]";
-            diagV6++;
+            if (end-pos < 40) { Count("short-IP"); return; }
+            int plen = U16(d,pos+4); if (plen == 0) { Count("IPv6-jumbo-unsupported"); return; }
+            if (pos+40+plen > end) Count("IP-truncated");
+            ipEnd = Math.Min(end,pos+40+plen); next = d[pos+6]; t = pos+40;
+            src = IP(d,pos+8,16); dst = IP(d,pos+24,16); Count("IPv6");
+            Count("NextHeader."+next);
+            while (next == 0 || next == 43 || next == 60)
+            {
+                if (t+2 > ipEnd) { Count("short-extension"); return; }
+                int n = (d[t+1]+1)*8;
+                if (t+n > ipEnd) { Count("short-extension"); return; }
+                next = d[t]; t += n; Count("NextHeader."+next);
+            }
+            if (next == 44) { Count("IPv6-fragment-unsupported"); return; }
         }
-        else { diagNonTcp++; return; }
-        if (ihl < 20 || pos + ihl + 20 > ipEnd) return;
-        int t = pos + ihl;
-        int sport = (d[t] << 8) | d[t + 1];
-        int dport = (d[t + 2] << 8) | d[t + 3];
+        else { Count("non-IP"); return; }
+        if (next != 6) { Count("non-TCP"); return; }
+        if (t+20 > ipEnd) { Count("short-TCP"); return; }
+        int sport = U16(d,t), dport = U16(d,t+2), th = (d[t+12]>>4)*4;
+        if (th < 20 || t+th > ipEnd) { Count("short-TCP"); return; }
+        string a = "["+src+"]:"+sport, b = "["+dst+"]:"+dport, direction = a+" > "+b;
+        string pair = String.CompareOrdinal(a,b) < 0 ? a+"|"+b : b+"|"+a;
+        Connection conn; if (!connections.TryGetValue(pair,out conn)) { conn = new Connection(); connections[pair] = conn; }
+        bool syn = (d[t+13]&2) != 0; uint seq = U32(d,t+4,false), old;
+        if (syn)
         {
-            string dk = src + ":" + sport + " > " + dst + ":" + dport;
-            long c; diagPkts.TryGetValue(dk, out c); diagPkts[dk] = c + 1;
-            int tdoff = (d[t + 12] >> 4) * 4; int pl = ipEnd - (t + tdoff);
-            if (tdoff >= 20 && pl > 0) { diagBytes.TryGetValue(dk, out c); diagBytes[dk] = c + pl; }
+            if (conn.Closed || (conn.Syns.TryGetValue(direction,out old) && old != seq) || (conn.Syns.Count == 0 && conn.Observed))
+            { conn.Session++; conn.Syns.Clear(); conn.Closed = false; Count("session-restarts"); }
+            conn.Syns[direction] = seq;
         }
-        if (serverPort > 0 && sport != serverPort) return;
-        uint seq = ((uint)d[t + 4] << 24) | ((uint)d[t + 5] << 16) | ((uint)d[t + 6] << 8) | d[t + 7];
-        int doff = (d[t + 12] >> 4) * 4;
-        if (doff < 20 || t + doff > ipEnd) return;
-        int plen = ipEnd - (t + doff);
-        if (plen <= 0) return;
-        var p = new byte[plen];
-        Buffer.BlockCopy(d, t + doff, p, 0, plen);
-        string key = src + ">" + dst + "|" + sport + ">" + dport;
-        List<Seg> l;
-        if (!flows.TryGetValue(key, out l)) { l = new List<Seg>(); flows[key] = l; }
-        l.Add(new Seg { Seq = seq, P = p });
-    }
-
-    static string Hex(byte[] b, int n)
-    {
-        var sb = new StringBuilder();
-        for (int i = 0; i < n && i < b.Length; i++) sb.Append(b[i].ToString("X2")).Append(' ');
-        return sb.ToString().Trim();
-    }
-
-    static void BuildDiag(int fileLen, Dictionary<string, List<Seg>> flows)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine("pcapng " + fileLen + " bytes, linktypes [" + diagLinks.Trim() + "], packet blocks " + diagBlocks + ", IPv6 TCP packets " + diagV6 + ", non-TCP packets " + diagNonTcp);
-        var list = new List<KeyValuePair<string, long>>(diagBytes);
-        list.Sort((a, b) => b.Value.CompareTo(a.Value));
-        sb.AppendLine("TCP flows with payload: " + list.Count + " (top 8 by bytes; the capture filter is by port, so these are the candidates)");
-        for (int i = 0; i < list.Count && i < 8; i++)
+        conn.Observed = true;
+        string key = sectionId+"#"+direction+"#"+conn.Session;
+        Flow f; if (!flows.TryGetValue(key,out f)) { f = new Flow { Key=direction, Port=sport, Session=conn.Session }; flows[key] = f; }
+        f.Packets++; f.Syn |= syn;
+        int nbytes = ipEnd-t-th; f.Bytes += nbytes;
+        if (nbytes > 0)
         {
-            long pk; diagPkts.TryGetValue(list[i].Key, out pk);
-            sb.AppendLine("  " + list[i].Key + "  payload " + list[i].Value + " bytes, packets " + pk);
+            byte[] p = new byte[nbytes]; Buffer.BlockCopy(d,t+th,p,0,nbytes);
+            f.Segs.Add(new Seg { Seq=unchecked(seq+(syn ? 1U : 0U)), P=p });
         }
-        long totalFlows = diagPkts.Count;
-        sb.AppendLine("TCP flows seen (any, incl. no payload): " + totalFlows);
-        string bigKey = null; int bigLen = -1;
-        foreach (var kv in flows)
-        {
-            long len = 0; foreach (var sg in kv.Value) len += sg.P.Length;
-            if (len > bigLen) { bigLen = (int)len; bigKey = kv.Key; }
-        }
-        if (bigKey != null)
-        {
-            var first = flows[bigKey]; uint b0 = first[0].Seq; first.Sort((a, b) => unchecked((int)(a.Seq - b0)).CompareTo(unchecked((int)(b.Seq - b0))));
-            sb.AppendLine("largest server->client flow " + bigKey.Replace("|", " ").Replace(">", " > ") + " (" + bigLen + " bytes) first 24 bytes: " + Hex(first[0].P, 24));
-        }
-        LastDiag = sb.ToString();
+        if ((d[t+13]&5) != 0) conn.Closed = true;
     }
 
     // ------------------------------------------------------------------ 프레임
@@ -717,39 +908,57 @@ $schemaB64 = 'H4sIAAAAAAAC/+19644bR5bmqyz021gwmWSSHCwEsIqUxBaLrOFFtmYwKKht9bQwar
 try {
     Add-Type -TypeDefinition $src -Language CSharp -ReferencedAssemblies 'System.Web.Extensions'
 } catch { Fail ('도구를 준비하지 못했습니다: ' + $_.Exception.Message) }
+try {
 $ms = New-Object IO.MemoryStream (, [Convert]::FromBase64String($schemaB64))
 $gz = New-Object IO.Compression.GZipStream ($ms, [IO.Compression.CompressionMode]::Decompress)
 $sr = New-Object IO.StreamReader ($gz, [Text.Encoding]::UTF8)
 $schemaJson = $sr.ReadToEnd(); $sr.Close()
 
-$work = Join-Path $env:TEMP 'ss_myinfo'
-$etl = Join-Path $work 'cap.etl'
-$pcapPath = $Pcap
-$keepCap = $false
+} catch { Fail '내장 해독 자료를 읽지 못했습니다. 도구를 다시 받아 주세요.' }
 
 try {
     if (-not $Pcap) {
         if (-not (Get-Command pktmon -ErrorAction SilentlyContinue)) { Fail 'Windows 10(1809 이상) 또는 11에서만 쓸 수 있습니다.' }
         New-Item -ItemType Directory -Force $work | Out-Null
-        Get-ChildItem $work -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-        $pcapPath = Join-Path $work 'cap.pcapng'
+        $captureId = [Guid]::NewGuid().ToString()
+        $etl = Join-Path $work ('cap-' + $captureId + '.etl')
+        $pcapPath = Join-Path $work ('cap-' + $captureId + '.pcapng')
 
         Say '=============================================================' 'Cyan'
         Say '  스타세이비어 내 정보 추출' 'Cyan'
         Say '=============================================================' 'Cyan'
-        if (Get-Process StarSavior -ErrorAction SilentlyContinue) {
-            Say ''
-            Say '[주의] 스타세이비어가 켜져 있습니다. 게임을 완전히 종료한 뒤 다시 실행해야 합니다.' 'Yellow'
-            Say '       (로그인 정보는 게임을 켤 때 한 번만 오기 때문입니다)' 'Yellow'
-        }
         # 서버 포트가 업데이트로 바뀐 적이 있다(9340 -> 9390). pktmon 의 -p 는 "포트 둘 다 가진 패킷"만 맞추고 필터는 최대 32개라
         # 포트 구간을 지정할 수 없다. 그래서 -Port 를 주지 않으면 TCP 전체를 받고, 해독기가 9300~9400 흐름을 우선해 고른다.
         [void](Pkt stop); [void](Pkt filter remove)
         if ($Port -gt 0) { [void](Pkt filter add SSGame -t TCP -p $Port) }
         else { [void](Pkt filter add SSGame -t TCP) }
+        if ($script:PktExitCode -ne 0) { Fail '캡처 필터 설정에 실패했습니다. 진단 파일의 pktmon 오류를 확인해 주세요.' }
         [void](Pkt filter list)
+        [void](Pkt list)
+        $script:CaptureStart = [DateTime]::UtcNow
+        DiagAdd ('capture-request=' + $script:CaptureStart.ToString('o'))
+        Record-GameState 'start'
+        if ($script:GamePreexisting) { Say '게임을 완전히 종료한 뒤 다시 해 주세요' 'Yellow' }
         $startOut = Pkt start --capture --pkt-size 0 --file-name $etl
-        if ($startOut -match '(?i)error|오류|실패|failed|이미|already') { Say ('[경고] 시작 중 문제가 있을 수 있습니다: ' + ($startOut -split "`n")[0]) 'Yellow' }
+        $startCode = $script:PktExitCode
+        $script:CaptureActive = ($startCode -eq 0)
+        $script:CaptureStart = [DateTime]::UtcNow
+        DiagAdd ('capture-start=' + $script:CaptureStart.ToString('o'))
+        Record-GameState 'confirmed'
+        [void](Pkt status)
+        $traceActive = [SsMyInfo]::IsCaptureRunning($etl)
+        DiagAdd ('capture-status ETW=' + $traceActive + ' query-code=' + [SsMyInfo]::TraceQueryCode)
+        if (-not $traceActive -and $startCode -eq 0) { DiagAdd 'capture-status: ETW 세션 확인 실패 — 종료 코드 0 이라 계속 진행(확인 방식 오판으로 전원이 막히지 않게)' }
+        if ($startCode -ne 0) {
+            $reason = '활성 기록을 확인하지 못했습니다. 진단 파일을 관리자에게 보내 주세요.'
+            if ($startCode -eq 5) { $reason = '권한이 거부되었습니다. 관리자 권한으로 다시 실행해 주세요.' }
+            elseif ($startCode -ne 0) {
+                $reason = ($startOut -split '[\r\n]+' | Where-Object { $_.Trim() } | Select-Object -First 1)
+                if (-not $reason) { $reason = 'pktmon을 시작하지 못했습니다. 진단 파일을 관리자에게 보내 주세요.' }
+                if ($reason.Length -gt 160) { $reason = $reason.Substring(0, 160) }
+            }
+            Fail ('캡처 시작 실패(종료 코드 ' + $startCode + '): ' + $reason)
+        }
         Say ''
         Say '준비됐습니다. 아래 순서대로 해 주세요.' 'Green'
         Say '  1) 스타세이비어를 실행하세요. (켜져 있으면 완전히 종료한 뒤 다시 실행)'
@@ -761,12 +970,17 @@ try {
         } else { [void](Read-Host '로비가 뜨면 엔터를 누르세요') }
         Start-Sleep -Seconds 2   # 마지막 패킷이 캡처에 반영될 시간
         Say '마무리하는 중...'
+        Record-GameState 'end'
+        DiagAdd ('capture-end=' + [DateTime]::UtcNow.ToString('o'))
         [void](Pkt stop)
+        if ($script:PktExitCode -ne 0) { Fail '캡처 종료에 실패했습니다. 진단 파일의 pktmon 오류를 확인해 주세요.' }
+        $script:CaptureActive = $false
         DiagAdd ('cap.etl: ' + $(if (Test-Path $etl) { (Get-Item $etl).Length.ToString() + ' bytes' } else { '없음' }))
         [void](Pkt etl2pcap $etl --out $pcapPath)
+        $convertCode = $script:PktExitCode
         [void](Pkt filter remove)
         DiagAdd ('cap.pcapng: ' + $(if (Test-Path $pcapPath) { (Get-Item $pcapPath).Length.ToString() + ' bytes' } else { '없음' }))
-        if (-not (Test-Path $pcapPath)) { Fail '통신 기록을 만들지 못했습니다. 관리자 확인 창에서 [예]를 눌렀는지 확인하고 다시 해 보세요.' }
+        if ($convertCode -ne 0 -or -not (Test-Path $pcapPath)) { Fail '통신 기록을 만들지 못했습니다. 관리자 확인 창에서 [예]를 눌렀는지 확인하고 다시 해 보세요.' }
     }
 
     Say '내 정보를 읽는 중... (몇 초 걸립니다)'
@@ -774,14 +988,14 @@ try {
     $json = [SsMyInfo]::Run($pcapPath, $schemaJson, $BuildLabel, $Port, [ref]$units, [ref]$info)
     DiagAdd ([SsMyInfo]::LastDiag)
     if (-not $json) {
-        if ([SsMyInfo]::LoginAckFailed -and -not $Pcap) {
-            $keepCap = $true
-            Say ''
-            Say ('[참고] 내 정보를 읽지 못해 통신 기록 파일을 남겼습니다: ' + $pcapPath) 'Yellow'
-            Say '       계정 정보가 들어 있으니 다른 사람에게 보내지 마세요.' 'Yellow'
-            DiagAdd ('캡처 파일 보존: ' + $pcapPath)
-        }
-        Fail ('내 정보를 찾지 못했습니다(' + $info + '). 이 창의 안내가 나온 뒤에 게임을 켜서 로비까지 들어갔는지 확인하고 다시 해 보세요. 게임이 막 업데이트됐다면 도구 갱신을 기다려야 할 수 있습니다.')
+        Preserve-Capture
+        DiagAdd ('decode-result: ' + $info)
+        Fail (Get-FailureGuidance)
+    }
+    Cleanup-Capture
+    if (($diag -join "`n") -match 'capture-(delete|expiry)-failed:') {
+        $cleanupDiag = Write-Diagnostic '캡처 파일 정리에 실패했습니다.'
+        Say ('캡처 파일 정리에 실패했습니다. 진단 위치: ' + $cleanupDiag) 'Yellow'
     }
     [IO.File]::WriteAllText($Out, $json, (New-Object Text.UTF8Encoding($false)))
     Say ''
@@ -789,7 +1003,7 @@ try {
     Say ('  완료: 구원자 {0}명의 정보를 저장했습니다.' -f $units) 'Green'
     Say ('  저장 위치: ' + $Out) 'Green'
     Say '=============================================================' 'Green'
-    Say '(통신 기록 파일은 로그인 정보가 있어 자동으로 삭제했습니다.)'
+    if (-not $Pcap) { Say '(통신 기록 파일에는 로그인 정보가 있어 삭제를 시도했습니다. 정리 실패 시 위 진단 위치를 확인해 주세요.)' }
     if (-not $NoOpen -and $Page -and -not $auto) {
         # 주소의 '#' 뒤(해시)에 데이터를 실어 사이트를 연다. 해시는 서버로 전송되지 않고 브라우저 안에서만 읽힌다.
         $bytes = [Text.Encoding]::UTF8.GetBytes($json)
@@ -804,7 +1018,8 @@ try {
             # 긴 주소를 explorer 에 직접 주면 해석하지 못하고 폴더가 열린다. 그래서 주소로 이동하는 작은 HTML 을 만들어
             # explorer 로 연다(관리자 창에서도 일반 권한의 기본 브라우저로 열림). 파일은 잠시 뒤 지운다.
             $open = Join-Path $env:TEMP 'ss_myinfo_open.html'
-            $h = '<!doctype html><meta charset="utf-8"><title>스타세이비어 내 정보</title><body style="font-family:sans-serif;padding:24px">사이트로 이동 중입니다... 이동하지 않으면 <a id="a">여기</a>를 누르세요.<script>var u="' + $url + '";document.getElementById("a").href=u;location.replace(u);</script></body>'
+            $safeUrl = $url.Replace('&', '\u0026').Replace('<', '\u003c').Replace('>', '\u003e').Replace("'", '\u0027')
+            $h = '<!doctype html><meta charset="utf-8"><title>스타세이비어 내 정보</title><body style="font-family:sans-serif;padding:24px">사이트로 이동 중입니다... 이동하지 않으면 <a id="a">여기</a>를 누르세요.<script>var u="' + $safeUrl + '";document.getElementById("a").href=u;location.replace(u);</script></body>'
             [IO.File]::WriteAllText($open, $h, (New-Object Text.UTF8Encoding($false)))
             Start-Process explorer.exe -ArgumentList ('"{0}"' -f $open)
             Start-Process powershell -WindowStyle Hidden -ArgumentList ('-NoProfile -Command "Start-Sleep 120; Remove-Item -LiteralPath ''{0}'' -Force -ErrorAction SilentlyContinue"' -f $open)
@@ -817,17 +1032,10 @@ try {
     }
 }
 catch {
-    DiagAdd ('exception: ' + $_.Exception.Message); DiagAdd ([SsMyInfo]::LastDiag)
-    if ([SsMyInfo]::LoginAckFailed -and -not $Pcap) {
-        $keepCap = $true
-        Say ('[참고] 내 정보를 읽지 못해 통신 기록 파일을 남겼습니다: ' + $pcapPath) 'Yellow'
-        Say '       계정 정보가 들어 있으니 다른 사람에게 보내지 마세요.' 'Yellow'
-    }
-    Fail $_.Exception.Message }
-finally {
-    if (-not $Pcap) {
-        [void](Pkt stop); [void](Pkt filter remove)
-        if (Test-Path $work) { Get-ChildItem $work -ErrorAction SilentlyContinue | Where-Object { -not ($keepCap -and $_.Name -eq 'cap.pcapng') } | Remove-Item -Force -ErrorAction SilentlyContinue }
-    }
+    DiagAdd ('exception: ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message)
+    DiagAdd ([SsMyInfo]::LastDiag)
+    Preserve-Capture
+    Fail $_.Exception.Message
 }
+finally { Cleanup-Capture }
 Pause-End
