@@ -167,6 +167,7 @@ function Pkt {
 }
 function Record-GameState([string]$Phase) {
     $procs = @(Get-Process -Name StarSavior -ErrorAction SilentlyContinue)
+    if ($Phase -eq 'end') { $script:GamePreexisting = $false }   # 안내대로 재실행했으면 마지막 관측 기준으로 다시 판정
     DiagAdd ('game ' + $Phase + ' present=' + ($procs.Count -gt 0))
     foreach ($proc in $procs) {
         $script:GameSeen = $true; $script:GamePids[$proc.Id] = $true
@@ -197,7 +198,7 @@ function Get-FailureGuidance {
 $work = Join-Path $env:TEMP 'ss_myinfo'
 $etl = ''; $pcapPath = $Pcap; $keepCap = $false; $script:CaptureActive = $false
 $script:GamePids = @{}; $script:GameSeen = $false; $script:GamePreexisting = $false; $script:GameConnected = $false
-Clear-ExpiredCaptures $work
+if (-not $Pcap) { Clear-ExpiredCaptures $work }   # -Pcap 재분석 때 입력 파일을 지우지 않게
 try { Validate-Inputs } catch { Fail $_.Exception.Message }
 
 # ---------- 관리자 권한 (캡처에 필요) ----------
@@ -946,7 +947,8 @@ try {
         DiagAdd ('capture-start=' + $script:CaptureStart.ToString('o'))
         Record-GameState 'confirmed'
         [void](Pkt status)
-        $traceActive = [SsMyInfo]::IsCaptureRunning($etl)
+        $traceActive = $false
+        try { $traceActive = [SsMyInfo]::IsCaptureRunning($etl) } catch { DiagAdd ('capture-status query-exception: ' + $_.Exception.GetType().Name) }
         DiagAdd ('capture-status ETW=' + $traceActive + ' query-code=' + [SsMyInfo]::TraceQueryCode)
         if (-not $traceActive -and $startCode -eq 0) { DiagAdd 'capture-status: ETW 세션 확인 실패 — 종료 코드 0 이라 계속 진행(확인 방식 오판으로 전원이 막히지 않게)' }
         if ($startCode -ne 0) {
@@ -980,7 +982,7 @@ try {
         $convertCode = $script:PktExitCode
         [void](Pkt filter remove)
         DiagAdd ('cap.pcapng: ' + $(if (Test-Path $pcapPath) { (Get-Item $pcapPath).Length.ToString() + ' bytes' } else { '없음' }))
-        if ($convertCode -ne 0 -or -not (Test-Path $pcapPath)) { Fail '통신 기록을 만들지 못했습니다. 관리자 확인 창에서 [예]를 눌렀는지 확인하고 다시 해 보세요.' }
+        if ($convertCode -ne 0 -or -not (Test-Path $pcapPath)) { Fail ('통신 기록 변환에 실패했습니다(종료 코드 ' + $convertCode + '). 디스크 공간을 확인하고 다시 해 보세요. 계속되면 진단 파일을 관리자에게 보내 주세요.') }
     }
 
     Say '내 정보를 읽는 중... (몇 초 걸립니다)'
