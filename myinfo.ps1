@@ -23,8 +23,8 @@ function Fail([string]$m) {
     try {
         if ($true) {   # 실패하면 항상 진단 파일을 남긴다(이른 실패도 오류 문구·환경은 기록)
             $dp = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보_진단.txt'
-            $hdr = @('스타세이비어 내 정보 추출 진단 (닉네임·UID·토큰·게임 데이터는 들어 있지 않습니다)', ('build ' + $BuildLabel + ', ' + (Get-Date -Format 's')), ('OS ' + [Environment]::OSVersion.VersionString + ', PS ' + $PSVersionTable.PSVersion), ('오류: ' + $m), '')
-            [IO.File]::WriteAllText($dp, (($hdr + $diag.ToArray()) -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
+            $hdr = @('스타세이비어 내 정보 추출 진단 (닉네임·UID·토큰·게임 데이터는 없음, PC 사용자 이름·IP 는 가림)', ('build ' + $BuildLabel + ', ' + (Get-Date -Format 's')), ('OS ' + [Environment]::OSVersion.VersionString + ', PS ' + $PSVersionTable.PSVersion), ('오류: ' + $m), '')
+            [IO.File]::WriteAllText($dp, (Mask-Diag (($hdr + $diag.ToArray()) -join "`r`n")), (New-Object Text.UTF8Encoding($true)))
             Say ''
             Say '실패 기록을 바탕화면에 저장했습니다. 이 파일을 관리자에게 보내 주세요.' 'Yellow'
             Say ('  ' + $dp) 'Yellow'
@@ -35,7 +35,38 @@ function Fail([string]$m) {
     Pause-End; exit 1
 }
 # pktmon 실행(출력은 진단용으로 보관)
-function Pkt { $o = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; $r = ''; try { $r = (& pktmon @args 2>&1 | Out-String).Trim() } catch { $r = 'EXC ' + $_.Exception.Message }; $ErrorActionPreference = $o; DiagAdd ('> pktmon ' + ($args -join ' ') + "`r`n" + $r); return $r }
+function Pkt {
+    # pktmon 출력은 Windows 판에 따라 UTF-8 또는 시스템 코드페이지라, 바이트로 받아 UTF-8(엄격) -> 실패 시 OEM 코드페이지로 읽는다(진단 파일 글자 깨짐 방지).
+    $r = ''
+    try {
+        $psi = New-Object Diagnostics.ProcessStartInfo 'pktmon'
+        $psi.Arguments = (($args | ForEach-Object { if ("$_" -match '\s') { '"' + $_ + '"' } else { "$_" } }) -join ' ')
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+        $latin = [Text.Encoding]::GetEncoding(28591); $psi.StandardOutputEncoding = $latin; $psi.StandardErrorEncoding = $latin
+        $pr = [Diagnostics.Process]::Start($psi)
+        $errTask = $pr.StandardError.ReadToEndAsync(); $outText = $pr.StandardOutput.ReadToEnd(); $pr.WaitForExit()
+        $raw = $latin.GetBytes($outText + $errTask.Result)
+        try { $r = (New-Object Text.UTF8Encoding($false, $true)).GetString($raw) }
+        catch { $r = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($raw) }
+        $r = $r.Trim()
+    } catch { $r = 'EXC ' + $_.Exception.Message }
+    DiagAdd ('> pktmon ' + ($args -join ' ') + "`r`n" + $r); return $r
+}
+# 진단 파일에서 PC 사용자 이름(경로)과 이 PC 의 IP 를 가린다(관리자에게 보내는 파일이므로).
+function Mask-Diag([string]$t) {
+    foreach ($kv in @(@($env:USERPROFILE, '%USERPROFILE%'), @($env:TEMP, '%TEMP%'), @($env:USERNAME, '%USERNAME%'))) {
+        if ($kv[0]) { $t = [regex]::Replace($t, [regex]::Escape($kv[0]), $kv[1], 'IgnoreCase') }
+    }
+    try {
+        foreach ($ni in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
+                $ip = $ua.Address.ToString()
+                if ($ip -ne '127.0.0.1' -and $ip -ne '::1') { $t = [regex]::Replace($t, '(?<![\d.])' + [regex]::Escape($ip) + '(?![\d])', '(내 PC IP)') }
+            }
+        }
+    } catch {}
+    return $t
+}
 
 if (-not $Out) { $Out = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보.json' }
 
@@ -89,7 +120,7 @@ public static class SsMyInfo
     public static List<byte[]> ServerStreams(string pcapPath, int serverPort)
     {
         byte[] d = File.ReadAllBytes(pcapPath);
-        diagBytes.Clear(); diagPkts.Clear(); diagBlocks = 0; diagNonTcp = 0; diagLinks = "";
+        diagBytes.Clear(); diagPkts.Clear(); diagBlocks = 0; diagNonTcp = 0; diagV6 = 0; diagLinks = "";
         var link = new List<int>();
         var flows = new Dictionary<string, List<Seg>>();
         int off = 0;
@@ -115,7 +146,7 @@ public static class SsMyInfo
         foreach (var kv in flows)
         {
             int sp = 0;
-            try { sp = int.Parse(kv.Key.Split(':')[1].Split('>')[0]); } catch { }
+            try { sp = FlowSrcPort(kv.Key); } catch { }
             if (serverPort <= 0 && (sp == 443 || sp == 80 || sp == 53)) continue;
             order.Add(kv);
         }
@@ -124,7 +155,7 @@ public static class SsMyInfo
             Func<KeyValuePair<string, List<Seg>>, int> pri = x =>
             {
                 int sp = 0;
-                try { sp = int.Parse(x.Key.Split(':')[1].Split('>')[0]); } catch { }
+                try { sp = FlowSrcPort(x.Key); } catch { }
                 return (sp >= 9300 && sp <= 9400) ? 0 : 1;
             };
             int c = pri(a).CompareTo(pri(b));
@@ -156,6 +187,14 @@ public static class SsMyInfo
         return result;
     }
 
+    static int diagV6;
+    // 흐름 키 = "출발>도착|출발포트>도착포트" (IPv6 주소에 ':' 가 있어 포트 구분자를 '|' 로 둠)
+    static int FlowSrcPort(string key)
+    {
+        string ports = key.Substring(key.LastIndexOf('|') + 1);
+        return int.Parse(ports.Split('>')[0]);
+    }
+
     static void ParseTcp(byte[] d, int pos, int cap, int linktype, int serverPort, Dictionary<string, List<Seg>> flows)
     {
         int end = pos + cap;
@@ -165,19 +204,35 @@ public static class SsMyInfo
             int et = (d[pos + 12] << 8) | d[pos + 13];
             pos += 14;
             if (et == 0x8100 || et == 0x88A8) { if (cap < 18) return; et = (d[pos + 2] << 8) | d[pos + 3]; pos += 4; }
-            if (et != 0x0800) { diagNonTcp++; return; }
+            if (et != 0x0800 && et != 0x86DD) { diagNonTcp++; return; }
         }
         else if (linktype != 101) { diagNonTcp++; return; }
-        if (end - pos < 20 || (d[pos] >> 4) != 4 || d[pos + 9] != 6) { diagNonTcp++; return; }
-        int ihl = (d[pos] & 0x0F) * 4;
-        int total = (d[pos + 2] << 8) | d[pos + 3];
-        int ipEnd = Math.Min(end, pos + total);
+        // IPv4 또는 IPv6(확장 헤더 없는 TCP). 게임 통신이 IPv6 로 오가는 환경 대응(2026-10-23).
+        int ihl, ipEnd; string src, dst;
+        if (end - pos >= 20 && (d[pos] >> 4) == 4 && d[pos + 9] == 6)
+        {
+            ihl = (d[pos] & 0x0F) * 4;
+            int total = (d[pos + 2] << 8) | d[pos + 3];
+            ipEnd = Math.Min(end, pos + total);
+            src = d[pos + 12] + "." + d[pos + 13] + "." + d[pos + 14] + "." + d[pos + 15];
+            dst = d[pos + 16] + "." + d[pos + 17] + "." + d[pos + 18] + "." + d[pos + 19];
+        }
+        else if (end - pos >= 40 && (d[pos] >> 4) == 6 && d[pos + 6] == 6)
+        {
+            ihl = 40;
+            int plen6 = (d[pos + 4] << 8) | d[pos + 5];
+            ipEnd = Math.Min(end, pos + 40 + plen6);
+            var a6 = new byte[16]; Buffer.BlockCopy(d, pos + 8, a6, 0, 16); src = "[" + new System.Net.IPAddress(a6).ToString() + "]";
+            var b6 = new byte[16]; Buffer.BlockCopy(d, pos + 24, b6, 0, 16); dst = "[" + new System.Net.IPAddress(b6).ToString() + "]";
+            diagV6++;
+        }
+        else { diagNonTcp++; return; }
         if (ihl < 20 || pos + ihl + 20 > ipEnd) return;
         int t = pos + ihl;
         int sport = (d[t] << 8) | d[t + 1];
         int dport = (d[t + 2] << 8) | d[t + 3];
         {
-            string dk = d[pos + 12] + "." + d[pos + 13] + "." + d[pos + 14] + "." + d[pos + 15] + ":" + sport + " > " + d[pos + 16] + "." + d[pos + 17] + "." + d[pos + 18] + "." + d[pos + 19] + ":" + dport;
+            string dk = src + ":" + sport + " > " + dst + ":" + dport;
             long c; diagPkts.TryGetValue(dk, out c); diagPkts[dk] = c + 1;
             int tdoff = (d[t + 12] >> 4) * 4; int pl = ipEnd - (t + tdoff);
             if (tdoff >= 20 && pl > 0) { diagBytes.TryGetValue(dk, out c); diagBytes[dk] = c + pl; }
@@ -190,7 +245,7 @@ public static class SsMyInfo
         if (plen <= 0) return;
         var p = new byte[plen];
         Buffer.BlockCopy(d, t + doff, p, 0, plen);
-        string key = d[pos + 12] + "." + d[pos + 13] + "." + d[pos + 14] + "." + d[pos + 15] + ">" + d[pos + 16] + "." + d[pos + 17] + "." + d[pos + 18] + "." + d[pos + 19] + ":" + sport + ">" + dport;
+        string key = src + ">" + dst + "|" + sport + ">" + dport;
         List<Seg> l;
         if (!flows.TryGetValue(key, out l)) { l = new List<Seg>(); flows[key] = l; }
         l.Add(new Seg { Seq = seq, P = p });
@@ -206,7 +261,7 @@ public static class SsMyInfo
     static void BuildDiag(int fileLen, Dictionary<string, List<Seg>> flows)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("pcapng " + fileLen + " bytes, linktypes [" + diagLinks.Trim() + "], packet blocks " + diagBlocks + ", non-IPv4/TCP packets " + diagNonTcp);
+        sb.AppendLine("pcapng " + fileLen + " bytes, linktypes [" + diagLinks.Trim() + "], packet blocks " + diagBlocks + ", IPv6 TCP packets " + diagV6 + ", non-TCP packets " + diagNonTcp);
         var list = new List<KeyValuePair<string, long>>(diagBytes);
         list.Sort((a, b) => b.Value.CompareTo(a.Value));
         sb.AppendLine("TCP flows with payload: " + list.Count + " (top 8 by bytes; the capture filter is by port, so these are the candidates)");
@@ -226,7 +281,7 @@ public static class SsMyInfo
         if (bigKey != null)
         {
             var first = flows[bigKey]; uint b0 = first[0].Seq; first.Sort((a, b) => unchecked((int)(a.Seq - b0)).CompareTo(unchecked((int)(b.Seq - b0))));
-            sb.AppendLine("largest server->client flow " + bigKey.Replace(">", " > ") + " (" + bigLen + " bytes) first 24 bytes: " + Hex(first[0].P, 24));
+            sb.AppendLine("largest server->client flow " + bigKey.Replace("|", " ").Replace(">", " > ") + " (" + bigLen + " bytes) first 24 bytes: " + Hex(first[0].P, 24));
         }
         LastDiag = sb.ToString();
     }
