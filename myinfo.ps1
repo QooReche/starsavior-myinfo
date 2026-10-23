@@ -21,11 +21,15 @@ function DiagAdd([string]$m) { [void]$diag.Add($m) }
 function Fail([string]$m) {
     Say ''; Say ('[오류] ' + $m) 'Red'
     try {
-        if ($diag.Count -gt 0) {
+        if ($true) {   # 실패하면 항상 진단 파일을 남긴다(이른 실패도 오류 문구·환경은 기록)
             $dp = Join-Path ([Environment]::GetFolderPath('Desktop')) '내정보_진단.txt'
             $hdr = @('스타세이비어 내 정보 추출 진단 (닉네임·UID·토큰·게임 데이터는 들어 있지 않습니다)', ('build ' + $BuildLabel + ', ' + (Get-Date -Format 's')), ('OS ' + [Environment]::OSVersion.VersionString + ', PS ' + $PSVersionTable.PSVersion), ('오류: ' + $m), '')
             [IO.File]::WriteAllText($dp, (($hdr + $diag.ToArray()) -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
-            Say ('진단 파일을 저장했습니다: ' + $dp + '  (문의할 때 이 파일을 첨부해 주세요)') 'Yellow'
+            Say ''
+            Say '실패 기록을 바탕화면에 저장했습니다. 이 파일을 관리자에게 보내 주세요.' 'Yellow'
+            Say ('  ' + $dp) 'Yellow'
+            Say '  (닉네임·계정 정보는 들어 있지 않습니다)' 'Yellow'
+            if (-not $auto) { try { Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $dp) } catch {} }
         }
     } catch {}
     Pause-End; exit 1
