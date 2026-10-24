@@ -142,7 +142,8 @@ function Fail([string]$m) {
     Say ('[오류] ' + $m) 'Red'
     $dp = Write-Diagnostic $m
     if ($dp) {
-        Say ('진단 파일을 관리자에게 보내 주세요: ' + $dp) 'Yellow'
+        Say ('진단 파일 내용을 아카라이브 원글 댓글로 남겨 주세요: ' + $dp) 'Yellow'
+        Say '원글: https://arca.live/b/starsavior/186845178' 'Yellow'
         if (-not $auto -and -not $NoOpen) { try { Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $dp) } catch {} }
     } else { Say '바탕화면과 임시 폴더 모두 진단 저장에 실패했습니다. 저장 권한과 디스크 여유 공간을 확인해 주세요.' 'Yellow' }
     Pause-End; exit 1
@@ -191,7 +192,7 @@ function Record-GameState([string]$Phase) {
 function Get-FailureGuidance {
     if ($script:GamePreexisting) { return '게임을 완전히 종료한 뒤 다시 해 주세요' }
     if (-not $Pcap -and -not $script:GameSeen) { return '게임을 켜서 로비까지 들어간 뒤 엔터를 눌러 주세요' }
-    return '게임 업데이트로 도구 갱신이 필요할 수 있습니다. 바탕화면 내정보_진단.txt 를 관리자에게 보내 주세요'
+    return '게임 업데이트로 도구 갱신이 필요할 수 있습니다. 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요'
 }
 
 
@@ -975,11 +976,11 @@ try {
         DiagAdd ('capture-status ETW=' + $traceActive + ' query-code=' + [SsMyInfo]::TraceQueryCode)
         if (-not $traceActive -and $startCode -eq 0) { DiagAdd 'capture-status: ETW 세션 확인 실패 — 종료 코드 0 이라 계속 진행(확인 방식 오판으로 전원이 막히지 않게)' }
         if ($startCode -ne 0) {
-            $reason = '활성 기록을 확인하지 못했습니다. 진단 파일을 관리자에게 보내 주세요.'
+            $reason = '활성 기록을 확인하지 못했습니다. 진단 파일 내용을 아카라이브 원글 댓글로 남겨 주세요.'
             if ($startCode -eq 5) { $reason = '권한이 거부되었습니다. 관리자 권한으로 다시 실행해 주세요.' }
             elseif ($startCode -ne 0) {
                 $reason = ($startOut -split '[\r\n]+' | Where-Object { $_.Trim() } | Select-Object -First 1)
-                if (-not $reason) { $reason = 'pktmon을 시작하지 못했습니다. 진단 파일을 관리자에게 보내 주세요.' }
+                if (-not $reason) { $reason = 'pktmon을 시작하지 못했습니다. 진단 파일 내용을 아카라이브 원글 댓글로 남겨 주세요.' }
                 if ($reason.Length -gt 160) { $reason = $reason.Substring(0, 160) }
             }
             Fail ('캡처 시작 실패(종료 코드 ' + $startCode + '): ' + $reason)
@@ -1005,7 +1006,7 @@ try {
         $convertCode = $script:PktExitCode
         [void](Pkt filter remove)
         DiagAdd ('cap.pcapng: ' + $(if (Test-Path $pcapPath) { (Get-Item $pcapPath).Length.ToString() + ' bytes' } else { '없음' }))
-        if ($convertCode -ne 0 -or -not (Test-Path $pcapPath)) { Fail ('통신 기록 변환에 실패했습니다(종료 코드 ' + $convertCode + '). 디스크 공간을 확인하고 다시 해 보세요. 계속되면 진단 파일을 관리자에게 보내 주세요.') }
+        if ($convertCode -ne 0 -or -not (Test-Path $pcapPath)) { Fail ('통신 기록 변환에 실패했습니다(종료 코드 ' + $convertCode + '). 디스크 공간을 확인하고 다시 해 보세요. 계속되면 진단 파일 내용을 아카라이브 원글 댓글로 남겨 주세요.') }
     }
 
     Say '내 정보를 읽는 중... (몇 초 걸립니다)'
