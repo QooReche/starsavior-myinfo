@@ -910,6 +910,7 @@ public static class SsMyInfo
         var slots = new List<object>();
         foreach (object entry in A(synchro[4]))
         {
+            if (entry == null) continue;
             var slot = A(entry); var sd = new Dictionary<string, object>();
             sd["index"] = L(slot[0]); sd["id"] = L(slot[1]); slots.Add(sd);
             // slot[2] is DateTime; it is not a level or an ID.
