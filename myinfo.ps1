@@ -881,7 +881,7 @@ public static class SsMyInfo
             var skills = new Dictionary<string, object>();
             skills["basic"] = L(sk[1]); skills["special"] = L(sk[2]); skills["ultimate"] = L(sk[3]); skills["passive"] = L(sk[4]);
             var u = new Dictionary<string, object>();
-            u["id"] = uid; u["star"] = L(rec[2]); u["sigil"] = L(rec[3]); u["resonance"] = L(rec[4]);
+            u["id"] = uid; u["level"] = L(rec[1]); u["star"] = L(rec[2]); u["sigil"] = L(rec[3]); u["resonance"] = L(rec[4]);
             u["skills"] = skills; u["favor"] = L(rec[10]); u["equip"] = equip;
             Dictionary<string, object> gd;
             if (gByUid.TryGetValue(L(rec[6]), out gd)) u["gauntlet"] = gd;
@@ -902,6 +902,19 @@ public static class SsMyInfo
         root["format"] = Format; root["game_build"] = buildLabel;
         root["exported_at"] = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:sszzz");
         root["star_link_level"] = L(synchro[2]); root["tactics"] = tac; root["units"] = units;
+        var link = new Dictionary<string, object>();
+        link["level"] = L(synchro[2]);
+        var source = new List<object>();
+        foreach (object id in A(synchro[3])) source.Add(L(id));
+        link["source"] = source;
+        var slots = new List<object>();
+        foreach (object entry in A(synchro[4]))
+        {
+            var slot = A(entry); var sd = new Dictionary<string, object>();
+            sd["index"] = L(slot[0]); sd["id"] = L(slot[1]); slots.Add(sd);
+            // slot[2] is DateTime; it is not a level or an ID.
+        }
+        link["slots"] = slots; root["star_link"] = link;
         // 보유 브레이크 스킬(궤도 배열) ud[31]: [스킬 ID, 레벨]. 스킬 획득·레벨업 응답이 돌려주는 쌍과 같은 클래스(레벨 1~10). 실캡처 대조는 미검증
         var brk = new List<object>();
         foreach (object bo in A(ud[31]))
