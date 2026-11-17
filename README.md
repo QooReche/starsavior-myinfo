@@ -38,3 +38,5 @@ $f="$env:TEMP\ss_myinfo.ps1"; iwr -UseBasicParsing https://raw.githubusercontent
 ## 안내
 
 비공식 팬 도구이며 게임 운영사와 무관합니다. 게임 약관상 이런 방식이 허용되는지는 보장할 수 없으니 사용은 본인 책임입니다.
+
+출력 형식은 `ss-myinfo-v1`을 유지합니다. `star_link.unlocked`는 SECTOR 3-15 클리어 이력에 따른 개방 여부이며, 누락·null은 판정 불가입니다. `units[].blossom`은 실제 개화 여부입니다. [형식·판정 근거](docs/FORMAT.md).

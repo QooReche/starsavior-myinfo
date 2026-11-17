@@ -836,6 +836,29 @@ public static class SsMyInfo
         d["stat"] = ((EnumV)l[0]).ToString(); d["value"] = L(l[1]); return d;
     }
 
+    // CONTENTS_UNLOCK_TEMPLET.json:445-447, CT_SYNCHRO / NORMAL_BATTLE_CLEAR (SECTOR 3-15).
+    const long SynchroUnlockStageId = 11003018;
+
+    public static bool? SynchroUnlocked(object userData)
+    {
+        // NKM.Templets:25984,20118-20131: ud[6] = List<history>, entry[0] = stage ID.
+        // NKC:540159-540163 replaces the entire history dictionary on login (no paging).
+        // NKC:579633,539509 checks ContainsKey, not the three mission-star booleans.
+        var ud = userData as List<object>;
+        if (ud == null || ud.Count <= 6) return null;
+        var history = ud[6] as List<object>;
+        if (history == null) return null;
+        bool found = false;
+        foreach (object entry in history)
+        {
+            var row = entry as List<object>;
+            if (row == null || row.Count != 4 || !(row[0] is long) ||
+                !(row[1] is bool) || !(row[2] is bool) || !(row[3] is bool)) return null;
+            if ((long)row[0] == SynchroUnlockStageId) found = true;
+        }
+        return found;
+    }
+
     public static string Export(object ack, string buildLabel)
     {
         var ud = A(A(ack)[2]);
@@ -882,6 +905,8 @@ public static class SsMyInfo
             skills["basic"] = L(sk[1]); skills["special"] = L(sk[2]); skills["ultimate"] = L(sk[3]); skills["passive"] = L(sk[4]);
             var u = new Dictionary<string, object>();
             u["id"] = uid; u["level"] = L(rec[1]); u["star"] = L(rec[2]); u["sigil"] = L(rec[3]); u["resonance"] = L(rec[4]);
+            // NKM.Templets:19987,20005: actual blossom state, never inferred from rarity/level.
+            if (rec.Count > 14 && rec[14] is bool) u["blossom"] = rec[14];
             u["skills"] = skills; u["favor"] = L(rec[10]); u["equip"] = equip;
             Dictionary<string, object> gd;
             if (gByUid.TryGetValue(L(rec[6]), out gd)) u["gauntlet"] = gd;
@@ -904,6 +929,8 @@ public static class SsMyInfo
         root["star_link_level"] = L(synchro[2]); root["tactics"] = tac; root["units"] = units;
         var link = new Dictionary<string, object>();
         link["level"] = L(synchro[2]);
+        bool? unlocked = SynchroUnlocked(ud);
+        if (unlocked.HasValue) link["unlocked"] = unlocked.Value;
         var source = new List<object>();
         foreach (object id in A(synchro[3])) source.Add(L(id));
         link["source"] = source;
