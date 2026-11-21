@@ -26,7 +26,7 @@
 - 대조: `python -I tools/schema_diff.py 옛.json 새.json` — 이름이 아니라 필드 순번으로 짝지어 82개 클래스·24개 enum 비교, 차이 0. 보조로 `NKM.Templets`·`NKM` 디컴파일을 `OBF_번호` 를 가리고 비교하면 줄 차이 0(43,486줄·20,303줄 동일).
 - 직렬화기: 설치본 `Bs.ServerLibrary.dll`(SHA256 `69537568fa2fa98852951a39b56f545e562ad1504ff6c5da09c5cf14fb271800`)의 `PacketReader/PacketWriter/Packet.ProcessRecv/Extract` 를 디컴파일해 해독기와 맞춰 봄 — zigzag varint(int·short·long), ushort varint 개수, 목록 원소마다 null 비트(bool), enum 은 int, DateTime/TimeSpan 은 8바이트 원값, 문자열은 short 길이(-1=null), 1024B 초과 본문은 LZ4 frame(64KB 블록 연결), 이하는 XOR. 해독기와 다른 점 없음.
 
-진단 경로(rexian 1121)를 이름으로 풀면(옛 → 새 OBF):
+진단 경로(사용자 제보 11/21)를 이름으로 풀면(옛 → 새 OBF):
 
 | 진단 위치 | 26610546 | 26752678 | 정의 |
 |---|---|---|---|
