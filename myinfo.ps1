@@ -1087,13 +1087,25 @@ try {
         Say ''
         Say '준비됐습니다. 아래 순서대로 해 주세요.' 'Green'
         Say '  1) 스타세이비어를 실행하세요. (켜져 있으면 완전히 종료한 뒤 다시 실행)'
-        Say '  2) 로그인해서 로비가 뜨면, 지금 이 글이 보이는 PowerShell 창(관리자 창)으로 돌아와 Enter를 누르세요.'
-        Say '     (게임 화면에서 누르는 것이 아닙니다. 이 창을 한 번 클릭한 뒤 Enter)'
+        Say '  2) 로그인해서 로비 화면까지 들어가세요.'
+        Say '  3) 로비가 보이면 바로 이 창(지금 이 글이 보이는 PowerShell 창)을 한 번 클릭하고 Enter를 누르세요.' 'Green'
+        Say '     ※ 게임 화면이 아니라 이 창에서 누릅니다.'
         Say ''
         if ($auto) {
             $t0 = Get-Date
             while (-not (Test-Path $StopFile) -and ((Get-Date) - $t0).TotalMinutes -lt 15) { Start-Sleep -Milliseconds 500 }
-        } else { [void](Read-Host '로비가 뜨면 이 PowerShell 창에서 Enter(게임 화면 아님)') }
+        } else {
+            while ($true) {
+                [void](Read-Host '▶ 게임 실행을 확인하고 로비까지 들어갔다면 여기서 Enter')
+                $running = @(Get-Process -Name StarSavior -ErrorAction SilentlyContinue).Count -gt 0
+                if ($running) { Say 'Enter 확인했습니다! 게임 실행 확인됨 → 내 정보를 가져오는 중입니다. 창을 닫지 말고 잠시 기다려 주세요.' 'Green'; break }
+                Say '게임이 아직 실행되지 않은 것 같습니다. 게임을 실행해 로비까지 들어간 뒤 다시 Enter를 눌러 주세요.' 'Yellow'
+                Say '  (게임을 이미 켰는데 이 안내가 계속 나오면 그냥 한 번 더 Enter — 그대로 진행합니다)'
+                [void](Read-Host '▶ 로비까지 들어갔다면 Enter')
+                Say 'Enter 확인했습니다! 내 정보를 가져오는 중입니다. 창을 닫지 말고 잠시 기다려 주세요.' 'Green'
+                break
+            }
+        }
         Start-Sleep -Seconds 2   # 마지막 패킷이 캡처에 반영될 시간
         Say '마무리하는 중...'
         Record-GameState 'end'
