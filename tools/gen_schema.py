@@ -72,10 +72,36 @@ def parse(text):
     return classes, enums, packet
 
 
+NESTED = re.compile(r"\b(?:class|struct|enum|interface)\s+OBF_\d+[^{;]*\{")
+
+
+def strip_nested(body):
+    """클래스 본문에서 중첩 형식(class/struct/enum/interface) 블록을 뺀 바깥 클래스 자신의 본문.
+
+    중첩 클래스가 바깥 Serialize 보다 앞에 있으면(예: 26752678 의 UserData #5 형식) 첫 Serialize 가
+    중첩 클래스의 것이라 바깥 필드 순서를 잘못 읽게 된다. 중첩 클래스는 parse() 가 따로 모은다."""
+    out, i = [], 0
+    while True:
+        m = NESTED.search(body, i)
+        if not m:
+            out.append(body[i:])
+            return "".join(out)
+        # 바깥 본문 깊이 0 에서 시작하는 선언만 중첩 형식이다(문자열·메서드 안 아님).
+        if body[:m.start()].count("{") != body[:m.start()].count("}"):
+            out.append(body[i:m.end()])
+            i = m.end()
+            continue
+        inner = block(body, m.end() - 1)
+        out.append(body[i:m.start()])
+        i = m.end() + len(inner) + 1  # 짝 맞는 '}' 다음
+
+
 def class_desc(name, body):
-    ser = re.search(r"void ISerializable\.Serialize\(IPacketStream (\w+)\)", body)
-    if not ser:
-        raise ValueError(name + ": Serialize not found")
+    body = strip_nested(body)
+    sers = list(re.finditer(r"void ISerializable\.Serialize\(IPacketStream (\w+)\)", body))
+    if len(sers) != 1:
+        raise ValueError(name + ": Serialize count %d" % len(sers))
+    ser = sers[0]
     decl_part = body[:ser.start()]
     fields = {}
     for m in re.finditer(r"public ([\w\.<>, \[\]?]+?) (OBF_\d+)(?: = [^;]+)?;", decl_part):
