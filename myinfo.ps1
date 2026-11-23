@@ -1141,7 +1141,19 @@ try {
         Record-GameState 'end'
         DiagAdd ('capture-end=' + [DateTime]::UtcNow.ToString('o'))
         [void](Pkt stop)
-        if ($script:PktExitCode -ne 0) { Fail '캡처 종료에 실패했습니다. 진단 파일의 pktmon 오류를 확인해 주세요.' }
+        if ($script:PktExitCode -ne 0) {
+            # 종료 코드는 실패인데 실제로는 멈춘 경우가 있다(11/23 제보: exit=4201 «WMI 데이터 공급자가 … 인스턴스 이름을 인식하지 않습니다»,
+            # 같은 출력에 «로그 플러시·손실된 이벤트 없음», 바로 다음 stop 은 «실행되고 있지 않음»). pktmon 문구 대신 ETW 세션 목록과 기록 파일로 판정한다.
+            $stopCode = $script:PktExitCode; $stillRunning = $true; $queryOk = $false
+            try { $stillRunning = [SsMyInfo]::IsCaptureRunning($etl); $queryOk = ([SsMyInfo]::TraceQueryCode -eq 0) } catch { DiagAdd ('capture-stop query-exception: ' + $_.Exception.GetType().Name) }
+            if ($queryOk -and $stillRunning) {
+                [void](Pkt stop)
+                try { $stillRunning = [SsMyInfo]::IsCaptureRunning($etl); $queryOk = ([SsMyInfo]::TraceQueryCode -eq 0) } catch { $queryOk = $false }
+            }
+            $etlOk = (Test-Path $etl) -and ((Get-Item $etl).Length -gt 0)
+            DiagAdd ('capture-stop recheck: first-exit=' + $stopCode + ' query-ok=' + $queryOk + ' running=' + $stillRunning + ' etl=' + $etlOk)
+            if (-not $queryOk -or $stillRunning -or -not $etlOk) { Fail '캡처 종료에 실패했습니다. 진단 파일의 pktmon 오류를 확인해 주세요.' }
+        }
         $script:CaptureActive = $false
         DiagAdd ('cap.etl: ' + $(if (Test-Path $etl) { (Get-Item $etl).Length.ToString() + ' bytes' } else { '없음' }))
         [void](Pkt etl2pcap $etl --out $pcapPath)
