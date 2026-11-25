@@ -220,7 +220,7 @@ function Get-FailureGuidance {
     if ($script:GamePreexisting) { return '게임을 완전히 종료한 뒤 다시 해 주세요' }
     if (-not $Pcap -and -not $script:GameSeen) { return '게임을 켜서 로비까지 들어간 뒤, 이 안내가 떠 있는 PowerShell 창(관리자 창)에서 Enter를 눌러 주세요(게임 화면에서 누르는 것이 아님)' }
     if (-not $Pcap -and [SsMyInfo]::GameFlows -eq 0) { return '게임 서버 통신이 기록되지 않았습니다. 게임 업데이트로 서버 포트가 바뀌었을 수 있어 도구 갱신이 필요합니다. 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요' }
-    if ([SsMyInfo]::LoginAckFailed -and [SsMyInfo]::CaptureDamaged) { return '통신 기록 일부가 깨졌을 수 있습니다. 게임을 완전히 종료하고 도구를 처음부터 한 번 더 실행해 주세요. 그래도 실패하면 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요' }
+    if ([SsMyInfo]::LoginAckFailed -and [SsMyInfo]::CaptureDamaged) { return '통신 기록 일부가 깨졌을 수 있습니다. 다운로드·방송 송출 등 통신을 많이 쓰는 프로그램을 잠시 멈추고, 게임을 완전히 종료한 뒤 도구를 처음부터 한 번 더 실행해 주세요. 그래도 실패하면 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요' }
     return '게임 업데이트로 도구 갱신이 필요할 수 있습니다. 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요'
 }
 
