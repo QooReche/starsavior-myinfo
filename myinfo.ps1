@@ -6,7 +6,7 @@ param(
     [string]$Out = '',
     [string]$Pcap = '',        # 이미 만든 캡처 파일을 해독만 할 때
     [string]$StopFile = '',    # 자동화용(이 파일이 생기면 캡처 종료)
-    [int]$Port = 0,            # 0 = 자동(TCP 전체를 받고 해독기가 서버 흐름을 고름). 서버 포트는 업데이트로 바뀐 적이 있음(9340 -> 9390)
+    [int]$Port = 0,            # 0 = 자동(클라 서버 목록의 9300~9400, 10 단위 포트만 받고 해독기가 서버 흐름을 고름). 서버 포트는 업데이트로 바뀐 적이 있음(9340 -> 9390)
     [string]$Page = 'https://qooreche.github.io/starsavior-party-navigator/',   # 끝나면 이 사이트를 열고 데이터를 넘김
     [switch]$NoOpen
 )
@@ -219,6 +219,7 @@ function Record-GameState([string]$Phase) {
 function Get-FailureGuidance {
     if ($script:GamePreexisting) { return '게임을 완전히 종료한 뒤 다시 해 주세요' }
     if (-not $Pcap -and -not $script:GameSeen) { return '게임을 켜서 로비까지 들어간 뒤, 이 안내가 떠 있는 PowerShell 창(관리자 창)에서 Enter를 눌러 주세요(게임 화면에서 누르는 것이 아님)' }
+    if (-not $Pcap -and [SsMyInfo]::GameFlows -eq 0) { return '게임 서버 통신이 기록되지 않았습니다. 게임 업데이트로 서버 포트가 바뀌었을 수 있어 도구 갱신이 필요합니다. 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요' }
     if ([SsMyInfo]::LoginAckFailed -and [SsMyInfo]::CaptureDamaged) { return '통신 기록 일부가 깨졌을 수 있습니다. 게임을 완전히 종료하고 도구를 처음부터 한 번 더 실행해 주세요. 그래도 실패하면 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요' }
     return '게임 업데이트로 도구 갱신이 필요할 수 있습니다. 바탕화면 내정보_진단.txt 내용을 아카라이브 원글 댓글로 남겨 주세요'
 }
@@ -325,6 +326,8 @@ public static class SsMyInfo
     public static string LastDiag = "";
     // 게임 흐름(시작 표식이 보인 흐름)에 빈 구간이나 내용이 다른 중복 조각이 있었는지(통신 기록 손상 의심)
     public static bool CaptureDamaged = false;
+    // 해독기가 읽은 게임 포트(9300~9400) 흐름 수. 0 = 캡처에 게임 서버 통신이 없음(포트 변경 의심)
+    public static int GameFlows = 0;
     static SortedDictionary<string, long> counts = new SortedDictionary<string, long>();
     static void Count(string key) { Count(key, 1); }
     static void Count(string key, long n) { long v; counts.TryGetValue(key, out v); counts[key] = v + n; }
@@ -342,7 +345,7 @@ public static class SsMyInfo
 
     public static List<byte[]> ServerStreams(string pcapPath, int serverPort)
     {
-        LastDiag = ""; counts.Clear(); CaptureDamaged = false;
+        LastDiag = ""; counts.Clear(); CaptureDamaged = false; GameFlows = 0;
         byte[] d = File.ReadAllBytes(pcapPath);
         var links = new List<int>(); var snaps = new List<uint>();
         var flows = new Dictionary<string, Flow>(); var connections = new Dictionary<string, Connection>();
@@ -416,7 +419,7 @@ public static class SsMyInfo
             if (!(f.Game || (f.Port >= 9300 && f.Port <= 9400) || (f.DPort >= 9300 && f.DPort <= 9400))) continue;
             gameListed++; sb.AppendLine("game-port-flow rank=" + (i+1) + " " + f.Key + " session=" + f.Session + " bytes=" + f.Bytes + " packets=" + f.Packets + " SYN=" + f.Syn + " game-header=" + f.Game + " gaps=" + f.Gaps + " overlap-diff=" + f.OverlapDiff);
         }
-        sb.AppendLine("game-port-flows=" + gameListed);
+        sb.AppendLine("game-port-flows=" + gameListed); GameFlows = gameListed;
         LastDiag = sb.ToString(); return result;
     }
 
@@ -1096,12 +1099,16 @@ try {
         Say '=============================================================' 'Cyan'
         Say '  스타세이비어 내 정보 추출' 'Cyan'
         Say '=============================================================' 'Cyan'
-        # 서버 포트가 업데이트로 바뀐 적이 있다(9340 -> 9390). pktmon 의 -p 는 "포트 둘 다 가진 패킷"만 맞추고 필터는 최대 32개라
-        # 포트 구간을 지정할 수 없다. 그래서 -Port 를 주지 않으면 TCP 전체를 받고, 해독기가 9300~9400 흐름을 우선해 고른다.
+        # 게임 서버 포트만 받는다. TCP 전체를 받으면 다른 게임 다운로드·스트리밍이 pktmon 기본 기록(원형 512MB, 가득 차면 오래된 것부터
+        # 덮어씀)을 몇 초 만에 채워 로그인 응답이 지워진다(11/25 제보 «다른 게임 다운로드 중 실패»).
+        # 포트 근거 = 클라 서버 목록(NKC: LiveKorea 9340·LiveJapan 9350·LiveGlobal 9380·LiveAsia 9390, 개발용 9300~9330) — 10 단위로 9300~9400 을 다 받는다.
+        # pktmon 은 필터 하나에 -p 를 하나만 주면 «보내는 쪽이나 받는 쪽 포트»로 맞추고(두 개 주면 둘 다 가진 패킷만), 필터끼리는 «또는»이다. 최대 32개.
         [void](Pkt stop); [void](Pkt filter remove)
-        if ($Port -gt 0) { [void](Pkt filter add SSGame -t TCP -p $Port) }
-        else { [void](Pkt filter add SSGame -t TCP) }
-        if ($script:PktExitCode -ne 0) { Fail '캡처 필터 설정에 실패했습니다. 진단 파일의 pktmon 오류를 확인해 주세요.' }
+        $capPorts = if ($Port -gt 0) { @($Port) } else { @(9300, 9310, 9320, 9330, 9340, 9350, 9360, 9370, 9380, 9390, 9400) }
+        foreach ($cp in $capPorts) {
+            [void](Pkt filter add ('SSGame' + $cp) -t TCP -p $cp)
+            if ($script:PktExitCode -ne 0) { Fail '캡처 필터 설정에 실패했습니다. 진단 파일의 pktmon 오류를 확인해 주세요.' }
+        }
         [void](Pkt filter list)
         [void](Pkt list)
         $script:CaptureStart = [DateTime]::UtcNow
