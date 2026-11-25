@@ -313,7 +313,7 @@ public static class SsMyInfo
     sealed class Seg { public uint Seq; public byte[] P; }
     sealed class Flow
     {
-        public string Key; public int Port, Session; public long Bytes, Packets;
+        public string Key; public int Port, DPort, Session; public long Bytes, Packets;
         public bool Syn, Tls, Game; public List<Seg> Segs = new List<Seg>();
         public long Gaps, OverlapDiff;   // 진단: 빈 구간 수, 겹쳐 받은 구간에서 내용이 다른 바이트 수
     }
@@ -407,6 +407,16 @@ public static class SsMyInfo
         {
             Flow f = order[i]; sb.AppendLine(f.Key + " session=" + f.Session + " bytes=" + f.Bytes + " packets=" + f.Packets + " SYN=" + f.Syn + " TLS=" + f.Tls + " game-header=" + f.Game + " gaps=" + f.Gaps + " overlap-diff=" + f.OverlapDiff);
         }
+        // 게임 서버 흐름(9300~9400 포트 또는 게임 프레임 표식)은 상위 20개 밖이어도 항상 적는다.
+        // 0줄 = 해독기가 게임 포트 TCP 를 하나도 읽지 못함(캡처에 없거나 non-IP·malformed·조각 등 앞 단계에서 버려짐).
+        int gameListed = 0;
+        for (int i=0; i<order.Count; i++)
+        {
+            Flow f = order[i];
+            if (!(f.Game || (f.Port >= 9300 && f.Port <= 9400) || (f.DPort >= 9300 && f.DPort <= 9400))) continue;
+            gameListed++; sb.AppendLine("game-port-flow rank=" + (i+1) + " " + f.Key + " session=" + f.Session + " bytes=" + f.Bytes + " packets=" + f.Packets + " SYN=" + f.Syn + " game-header=" + f.Game + " gaps=" + f.Gaps + " overlap-diff=" + f.OverlapDiff);
+        }
+        sb.AppendLine("game-port-flows=" + gameListed);
         LastDiag = sb.ToString(); return result;
     }
 
@@ -491,6 +501,9 @@ public static class SsMyInfo
         {
             if (end-pos < 20) { Count("short-IP"); return; }
             int ihl = (d[pos]&15)*4, total = U16(d,pos+2);
+            // 보내는 쪽 묶음 처리(LSOv2)로 합쳐진 큰 패킷은 pktmon 기록에서 IP 전체 길이가 0으로 적힌다. 버리지 않고 캡처된 길이로 읽는다.
+            // 이더넷 최소 프레임(IP 부분 46바이트)은 패딩이 섞일 수 있어 복구하지 않는다(LSO 패킷은 MSS 보다 커서 여기에 걸리지 않음).
+            if (total == 0 && ihl >= 20 && end-pos > 46 && end-pos >= ihl+20) { Count("IPv4-length-zero-offload"); total = end-pos; }
             if (ihl < 20 || total < ihl) { Count("malformed-IP"); return; }
             if (pos+total > end) Count("IP-truncated");
             ipEnd = Math.Min(end,pos+total); next = d[pos+9]; Count("NextHeader."+next);
@@ -500,7 +513,9 @@ public static class SsMyInfo
         else if ((d[pos] >> 4) == 6)
         {
             if (end-pos < 40) { Count("short-IP"); return; }
-            int plen = U16(d,pos+4); if (plen == 0) { Count("IPv6-jumbo-unsupported"); return; }
+            int plen = U16(d,pos+4);
+            if (plen == 0 && d[pos+6] != 0 && end-pos >= 60) { Count("IPv6-length-zero-offload"); plen = end-pos-40; }
+            if (plen == 0) { Count("IPv6-jumbo-unsupported"); return; }
             if (pos+40+plen > end) Count("IP-truncated");
             ipEnd = Math.Min(end,pos+40+plen); next = d[pos+6]; t = pos+40;
             src = IP(d,pos+8,16); dst = IP(d,pos+24,16); Count("IPv6");
@@ -531,7 +546,7 @@ public static class SsMyInfo
         }
         conn.Observed = true;
         string key = sectionId+"#"+direction+"#"+conn.Session;
-        Flow f; if (!flows.TryGetValue(key,out f)) { f = new Flow { Key=direction, Port=sport, Session=conn.Session }; flows[key] = f; }
+        Flow f; if (!flows.TryGetValue(key,out f)) { f = new Flow { Key=direction, Port=sport, DPort=dport, Session=conn.Session }; flows[key] = f; }
         f.Packets++; f.Syn |= syn;
         int nbytes = ipEnd-t-th; f.Bytes += nbytes;
         if (nbytes > 0)
